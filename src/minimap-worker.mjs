@@ -45,7 +45,7 @@ export function rasterize(frame) {
     return run.glyphs.map(glyph => {
       const cells = widths.get(glyph), x = 2 + column * cellWidth;
       column += cells;
-      return glyph.trim() && cells ? `<use href="#g${ids.get(glyph)}" fill="${run.color}" transform="translate(${x} ${Math.min(height - geometry.fontSize, sourceRows[y] * geometry.lineHeight)}) scale(${cellWidth / 6} ${geometry.fontSize / 10})"/>` : "";
+      return glyph.trim() && cells ? `<use href="#g${ids.get(glyph)}" fill="${run.color}" transform="translate(${x} ${(sourceRows[y] - geometry.start) * geometry.lineHeight}) scale(${cellWidth / 6} ${geometry.fontSize / 10})"/>` : "";
     });
   })).join("");
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><rect width="100%" height="100%" fill="${dark ? "#1e1e1e" : "#ffffff"}"/><defs>${definitions}</defs>${text}</svg>`;

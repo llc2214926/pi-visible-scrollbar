@@ -103,10 +103,13 @@ export class Sidebar implements Component {
     const theme = this.ctx.ui.theme;
     return Array.from({ length: snapshot.height }, (_, row) => {
       const entries = this.tracks[row];
-      const mark = entries.length > 1 ? "≡ " : entries.length ? "━ " : "  ";
+      let mark = "  ";
+      if (entries.length > 1) mark = "≡ ";
+      else if (entries.length) mark = "━ ";
       const inView = row >= geometry.top && row < geometry.top + geometry.size;
       const inMapView = mapGeometry && row + 1 > mapGeometry.top && row < mapGeometry.top + mapGeometry.size;
-      return (miniWidth ? inMapView ? theme.bg("selectedBg", " ".repeat(miniWidth)) : " ".repeat(miniWidth) : "") +
+      const mapRow = " ".repeat(miniWidth);
+      return (inMapView ? theme.bg("selectedBg", mapRow) : mapRow) +
         theme.fg("accent", mark) + theme.fg(inView ? "scrollbarThumb" : "scrollbarTrack", inView ? "┃" : "│");
     });
   }
@@ -124,7 +127,7 @@ export class Sidebar implements Component {
     const onMap = event.x < miniWidth;
     const cells = getCellDimensions();
     const mapGeometry = onMap || this.drag?.kind === "map"
-      ? this.map.geometry ?? minimapGeometry(snapshot, miniWidth * cells.widthPx, snapshot.height * cells.heightPx) : undefined;
+      ? minimapGeometry(snapshot, miniWidth * cells.widthPx, snapshot.height * cells.heightPx) : undefined;
     if (event.type === "move") {
       const wasDragging = !!this.drag;
       this.drag = undefined;
@@ -153,16 +156,21 @@ export class Sidebar implements Component {
     }
     if (event.type === "drag" && this.drag) {
       const latest = this.viewport.snapshot();
-      const row = this.drag.kind === "map" && mapGeometry
-        ? minimapDragTop(event.y, this.drag.grab, { ...mapGeometry, max: Math.max(0, latest.contentHeight - latest.height) })
+      let row = this.drag.kind === "map" && mapGeometry
+        ? minimapDragTop(event.y, this.drag.grab, minimapGeometry(latest, miniWidth * cells.widthPx, latest.height * cells.heightPx))
         : dragTop(event.y, this.drag.grab, latest.contentHeight, latest.height);
+      // Cell-level mouse hits can grab above/below the actual fractional-row rectangle.
+      if (this.drag.kind === "map") {
+        if (event.y <= 0) row = 0;
+        else if (event.y >= latest.height - 1) row = Math.max(0, latest.contentHeight - latest.height);
+      }
       this.viewport.scrollTo(row, true);
       return { capture: true, render: false };
     }
     if (event.type === "release") { this.drag = undefined; return { handled: true }; }
     if (event.type === "click" && event.button === "left") {
       if (this.suppressClick) { this.suppressClick = false; return { handled: true }; }
-      if (onMap && mapGeometry) this.viewport.scrollTo(Math.round(mapGeometry.start + (event.y + 0.5) * mapGeometry.count / (mapGeometry.size + mapGeometry.travel || 1) - snapshot.height / 2));
+      if (onMap && mapGeometry) this.viewport.scrollTo(Math.round(mapGeometry.start + (event.y + 0.5) * mapGeometry.count / Math.max(1, snapshot.height) - snapshot.height / 2));
       else if (marker && group.length === 1) this.viewport.jump(group[0].id);
       else if (marker && group.length > 1) this.openPopup(group, event);
       else if (!onThumbLane) this.viewport.scrollTo(Math.floor(event.y * snapshot.contentHeight / Math.max(1, snapshot.height)));

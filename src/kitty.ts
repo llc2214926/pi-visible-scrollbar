@@ -1,13 +1,13 @@
 import { allocateImageId, deleteKittyImage, encodeKitty, type CellDimensions } from "@earendil-works/pi-tui";
 import type { MinimapLayers } from "./minimap.ts";
 
-/** Two owned images and stable placement IDs. Moving the viewport never retransmits its background. */
+/** Two owned images and stable placement IDs. Scroll cached text by cropping its background placement. */
 export class KittyLayers {
   readonly backgroundId = allocateImageId();
   readonly viewportId: number;
   private background?: Buffer;
   private viewport?: Buffer;
-  private position = "";
+  private backgroundPosition = "";
   private viewportPosition = "";
   private uploaded = false;
   private failures = new Set<number>();
@@ -26,6 +26,7 @@ export class KittyLayers {
       : Math.round(layers.viewport.readUInt32BE(20) * box.width * cells.widthPx / layers.viewport.readUInt32BE(16));
     const pixelTop = Math.max(0, Math.min(box.height * cells.heightPx - viewportHeight, Math.round(layers.top * box.height * cells.heightPx)));
     const row = box.y + Math.floor(pixelTop / cells.heightPx), offset = pixelTop % cells.heightPx;
+    const backgroundPosition = `${position}:${layers.backgroundTop}:${layers.backgroundHeight}`;
     const viewportPosition = `${position}:${pixelTop}:${layers.fullHeight}`;
     let output = "";
     const upload = (id: number, png: Buffer) => {
@@ -35,8 +36,8 @@ export class KittyLayers {
     };
     if (backgroundChanged) upload(this.backgroundId, layers.background);
     if (viewportChanged) upload(this.viewportId, layers.viewport);
-    if (backgroundChanged || !preserved || position !== this.position) {
-      output += `\x1b[${box.y + 1};${box.x + 1}H\x1b_Ga=p,i=${this.backgroundId},p=1,C=1,q=0,c=${box.width},r=${box.height},z=0\x1b\\`;
+    if (backgroundChanged || !preserved || backgroundPosition !== this.backgroundPosition) {
+      output += `\x1b[${box.y + 1};${box.x + 1}H\x1b_Ga=p,i=${this.backgroundId},p=1,C=1,q=0,c=${box.width},r=${box.height},y=${layers.backgroundTop},h=${layers.backgroundHeight},z=0\x1b\\`;
     }
     if (backgroundChanged || viewportChanged || !preserved || viewportPosition !== this.viewportPosition) {
       // Only specifying columns preserves fractional-row image height; Y is an in-cell pixel offset.
@@ -45,7 +46,7 @@ export class KittyLayers {
     }
     this.background = layers.background;
     this.viewport = layers.viewport;
-    this.position = position;
+    this.backgroundPosition = backgroundPosition;
     this.viewportPosition = viewportPosition;
     this.uploaded = true;
     return output;
@@ -64,7 +65,7 @@ export class KittyLayers {
 
   private forget(): void {
     this.background = this.viewport = undefined;
-    this.position = this.viewportPosition = "";
+    this.backgroundPosition = this.viewportPosition = "";
   }
   clear(): string {
     const output = this.uploaded ? deleteKittyImage(this.backgroundId) + deleteKittyImage(this.viewportId) : "";

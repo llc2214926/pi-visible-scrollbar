@@ -1,4 +1,4 @@
-import { sliceByColumn, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { getCellDimensions, sliceByColumn, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { Worker } from "node:worker_threads";
 import type { Snapshot } from "./model.ts";
 import { rasterPng, rectanglePng, viewportPng } from "./png.ts";
@@ -66,22 +66,22 @@ export interface MiniGeometry {
   max: number;
 }
 
-/** Fixed full-history overview. Sampling depends on document/layout, never the scroll position. */
+/** Keep the measured text scale; scroll the map window only when the scaled document exceeds it. */
 export function minimapGeometry(snapshot: Snapshot, widthPx: number, heightPx: number): MiniGeometry {
   [widthPx, heightPx] = rasterSize(widthPx, heightPx);
+  const cells = getCellDimensions();
   const fontSize = (widthPx - 4) / Math.max(1, snapshot.width) / 0.6;
-  const desiredLineHeight = Math.max(1, fontSize * 1.6);
-  const count = Math.max(1, snapshot.contentHeight);
-  const samples = Math.min(count, Math.max(1, Math.min(384, Math.floor(heightPx / desiredLineHeight))));
-  const lineHeight = heightPx / count;
-  const minimum = Math.min(3, Math.max(1, snapshot.height - 1));
-  // Map the entire document to the full viewport height, including short histories.
-  // Keep a usable rectangle rather than a one-row strip, but leave travel in small views.
-  const size = Math.min(snapshot.height, Math.max(minimum, snapshot.height * snapshot.height / count));
-  const travel = Math.max(0, snapshot.height - size);
+  const lineHeight = Math.min(heightPx / Math.max(1, snapshot.height), (widthPx - 4) / Math.max(1, snapshot.width) * cells.heightPx / cells.widthPx);
+  const count = heightPx / lineHeight;
+  const total = Math.max(1, snapshot.contentHeight);
   const max = Math.max(0, snapshot.contentHeight - snapshot.height);
-  const fraction = max ? Math.max(0, Math.min(1, snapshot.top / max)) : 0;
-  return { start: 0, count, samples, fontSize, lineHeight, top: fraction * travel, size, travel, max };
+  const position = Math.max(0, Math.min(max, snapshot.top));
+  const start = max ? position / max * Math.max(0, total - count) : 0;
+  const rowScale = lineHeight * snapshot.height / heightPx;
+  const size = Math.min(snapshot.height, total) * rowScale;
+  const travel = Math.max(0, Math.min(snapshot.height - size, max * rowScale));
+  const samples = Math.max(0, Math.min(snapshot.contentHeight, Math.ceil(start + count)) - Math.floor(start));
+  return { start, count, samples, fontSize, lineHeight, top: max ? position / max * travel : 0, size, travel, max };
 }
 
 export function minimapDragTop(pointer: number, grab: number, geometry: MiniGeometry): number {
@@ -90,6 +90,8 @@ export function minimapDragTop(pointer: number, grab: number, geometry: MiniGeom
 
 export interface MinimapLayers {
   background: Buffer;
+  backgroundTop: number;
+  backgroundHeight: number;
   viewport: Buffer;
   top: number;
   fullHeight: boolean;
@@ -100,13 +102,14 @@ interface Request {
   lines: readonly string[];
   width: number;
   height: number;
+  offset: number;
   columns: number;
   sourceRows: number[];
   geometry: MiniGeometry;
   dark: boolean;
 }
 function sameRequest(a: Request, b?: Request): boolean {
-  return !!b && a.key === b.key && a.lines.length === b.lines.length &&
+  return !!b && a.key === b.key && a.offset === b.offset && a.height === b.height && a.lines.length === b.lines.length &&
     a.lines.every((line, i) => line === b.lines[i] && a.sourceRows[i] === b.sourceRows[i]);
 }
 
@@ -138,9 +141,10 @@ export class Minimap {
   render(snapshot: Snapshot, width: number, height: number, dark: boolean, dragging = false): Buffer | undefined {
     const frame = this.frame(snapshot, width, height, dark);
     if (!frame) return undefined;
-    const pngKey = `${this.rasterVersion}:${frame.top}:${frame.bottom}:${dark}:${dragging}`;
+    const pngKey = `${this.rasterVersion}:${frame.offset}:${frame.top}:${frame.bottom}:${dark}:${dragging}`;
     if (pngKey !== this.pngKey) {
-      this.png = viewportPng(this.pixels!, frame.width, frame.height, frame.top, frame.bottom, dark, dragging);
+      const pixels = this.pixels!.subarray(frame.offset * frame.width * 4, (frame.offset + frame.height) * frame.width * 4);
+      this.png = viewportPng(pixels, frame.width, frame.height, frame.top, frame.bottom, dark, dragging);
       this.pngKey = pngKey;
     }
     return this.png;
@@ -149,30 +153,32 @@ export class Minimap {
   renderLayers(snapshot: Snapshot, width: number, height: number, dark: boolean, dragging = false): MinimapLayers | undefined {
     const frame = this.frame(snapshot, width, height, dark);
     if (!frame) return undefined;
-    if (this.background?.version !== this.rasterVersion) this.background = { version: this.rasterVersion, png: rasterPng(this.pixels!, frame.width, frame.height) };
+    if (this.background?.version !== this.rasterVersion) this.background = { version: this.rasterVersion, png: rasterPng(this.pixels!, frame.width, this.completed!.height) };
     const key = `${frame.width}:${frame.bottom - frame.top}:${dark}:${dragging}`;
     if (this.rectangle?.key !== key) this.rectangle = { key, png: rectanglePng(frame.width, frame.bottom - frame.top, dark, dragging) };
-    return { background: this.background.png, viewport: this.rectangle.png, top: frame.top / frame.height, fullHeight: frame.bottom - frame.top === frame.height };
+    return { background: this.background.png, backgroundTop: frame.offset, backgroundHeight: frame.height, viewport: this.rectangle.png, top: frame.top / frame.height, fullHeight: frame.bottom - frame.top === frame.height };
   }
 
-  private frame(snapshot: Snapshot, width: number, height: number, dark: boolean): { width: number; height: number; top: number; bottom: number } | undefined {
+  private frame(snapshot: Snapshot, width: number, height: number, dark: boolean): { width: number; height: number; offset: number; top: number; bottom: number } | undefined {
     if (this.failure) throw this.failure;
     if (snapshot.preparing) return undefined;
     [width, height] = rasterSize(width, height);
     const geometry = minimapGeometry(snapshot, width, height);
     this.geometry = geometry;
-    const key = `${width}:${height}:${snapshot.width}:${geometry.count}:${dark}`;
-    if (key !== this.requested?.key || this.sourceLines !== snapshot.lines) {
-      const sourceRows = Array.from({ length: geometry.samples }, (_, i) => {
-        const start = Math.floor(i * geometry.count / geometry.samples);
-        const end = Math.floor((i + 1) * geometry.count / geometry.samples);
-        // Prefer real text to blank separators, but keep one representative line per fixed history band.
-        for (let row = start; row < end; row++) if (stripTerminalSequences(snapshot.lines[row] ?? "").trim()) return row;
-        return start;
-      });
+    const key = `${width}:${height}:${snapshot.width}:${geometry.lineHeight}:${dark}`;
+    const viewOffset = Math.round(geometry.start * geometry.lineHeight);
+    const covers = (request?: Request) => !!request && request.key === key && viewOffset >= request.offset && viewOffset + height <= request.offset + request.height;
+    if (!covers(this.requested) || this.sourceLines !== snapshot.lines) {
+      // Cache up to three map screens, not the full history; nearby scrolling is just a pixel crop.
+      const cacheHeight = Math.max(height, Math.min(4096, height * 3, Math.ceil(snapshot.contentHeight * geometry.lineHeight)));
+      const offset = covers(this.requested) && this.requested!.height === cacheHeight ? this.requested!.offset
+        : Math.max(0, Math.min(Math.round(snapshot.contentHeight * geometry.lineHeight) - cacheHeight, viewOffset - height));
+      const first = Math.floor(offset / geometry.lineHeight);
+      const end = Math.min(snapshot.contentHeight, Math.ceil((offset + cacheHeight) / geometry.lineHeight));
+      const sourceRows = Array.from({ length: Math.max(0, end - first) }, (_, i) => first + i);
       const request: Request = {
-        key, lines: sourceRows.map(row => snapshot.lines[row] ?? ""), sourceRows, width, height,
-        columns: snapshot.width, geometry, dark,
+        key, lines: sourceRows.map(row => snapshot.lines[row] ?? ""), sourceRows, width, height: cacheHeight, offset,
+        columns: snapshot.width, geometry: { ...geometry, start: offset / geometry.lineHeight }, dark,
       };
       this.sourceLines = snapshot.lines;
       if (!sameRequest(request, this.requested)) {
@@ -180,11 +186,11 @@ export class Minimap {
         this.schedule();
       }
     }
-    // The worker only supplies an immutable background. Rectangle movement never waits for it.
-    if (!this.pixels || this.completed?.width !== width || this.completed.height !== height) return undefined;
-    const top = Math.max(0, Math.min(height - 1, Math.round(geometry.top / Math.max(1, snapshot.height) * height)));
-    const bottom = Math.max(top + 1, Math.min(height, Math.round((geometry.top + geometry.size) / Math.max(1, snapshot.height) * height)));
-    return { width, height, top, bottom };
+    // Never place the current rectangle over text from an unrelated, still-pending map window.
+    if (!this.pixels || !covers(this.completed)) return undefined;
+    const size = Math.max(1, Math.min(height, Math.round(geometry.size / Math.max(1, snapshot.height) * height)));
+    const top = Math.max(0, Math.min(height - size, Math.round(geometry.top / Math.max(1, snapshot.height) * height)));
+    return { width, height, offset: viewOffset - this.completed!.offset, top, bottom: top + size };
   }
 
   private schedule(): void {
