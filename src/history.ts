@@ -9,6 +9,8 @@ interface NativeFields {
   text?: unknown;
   skillBlock?: Partial<host.ParsedSkillBlock>;
   lastMessage?: { timestamp?: unknown };
+  message?: { customType?: unknown; content?: unknown };
+  status?: unknown;
 }
 function nativeFields(component: Component): NativeFields {
   // SAFETY: Pi's private card fields are read-only here; every consumed field is checked at runtime.
@@ -19,7 +21,8 @@ interface Boundary { component: Component; slot: number; signature: string; prom
 export function userText(entry: Entry): string | undefined {
   if (entry.type !== "message" || entry.message.role !== "user") return undefined;
   const content = entry.message.content;
-  return typeof content === "string" ? content : content.filter(c => c.type === "text").map(c => c.text).join("\n");
+  // Pi joins text blocks without inserting separators when it creates the native card.
+  return typeof content === "string" ? content : content.filter(c => c.type === "text").map(c => c.text).join("");
 }
 function attachments(entry: Entry): number {
   if (entry.type !== "message" || entry.message.role !== "user") return 0;
@@ -30,10 +33,23 @@ function signature(text: string): string {
   const skill = host.parseSkillBlock(text);
   return skill ? `skill:${JSON.stringify([skill.name, skill.content, skill.userMessage])}` : `user:${text}`;
 }
+function customSignature(customType: string, content: unknown): string {
+  return `custom:${JSON.stringify([customType, content])}`;
+}
+function bashSignature(command: string, output: string): string {
+  // Native bash cards remove terminal escapes and normalize line endings.
+  return `bash:${JSON.stringify([command, stripTerminalSequences(output).replace(/\r\n?/g, "\n")])}`;
+}
 function entrySignature(entry: Entry): string | undefined {
+  if (entry.type === "custom_message") return customSignature(entry.customType, entry.content);
   const text = userText(entry);
   if (text !== undefined && text.length) return signature(text);
-  if (entry.type === "message" && entry.message.role === "assistant") return `assistant:${entry.message.timestamp}`;
+  if (entry.type === "message") {
+    const message = entry.message;
+    if (message.role === "assistant") return `assistant:${message.timestamp}`;
+    if (message.role === "custom") return customSignature(message.customType, message.content);
+    if (message.role === "bashExecution") return bashSignature(message.command, message.output);
+  }
   return undefined;
 }
 function promptFor(entry: Entry, index: number): Prompt | undefined {
@@ -68,6 +84,17 @@ function boundaries(children: readonly Component[]): Boundary[] {
     } else if (component instanceof host.AssistantMessageComponent) {
       const message = nativeFields(component).lastMessage;
       if (typeof message?.timestamp === "number") result.push({ component, slot, signature: `assistant:${message.timestamp}`, prompt: false });
+    } else if (component instanceof host.CustomMessageComponent) {
+      const message = nativeFields(component).message;
+      if (typeof message?.customType === "string" && (typeof message.content === "string" || Array.isArray(message.content))) {
+        result.push({ component, slot, signature: customSignature(message.customType, message.content), prompt: false });
+      }
+    } else if (component instanceof host.BashExecutionComponent) {
+      // A running command is not persisted yet, even if its output matches an older command.
+      const status = nativeFields(component).status;
+      if (status === "complete" || status === "cancelled" || status === "error") {
+        result.push({ component, slot, signature: bashSignature(component.getCommand(), component.getOutput()), prompt: false });
+      }
     } else if (component.constructor === Container) {
       const list = (component as Container).children;
       for (let i = 0; i < list.length; i++) {

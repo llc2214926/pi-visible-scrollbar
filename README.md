@@ -22,9 +22,25 @@ Pi 全屏会话右侧的用户输入导航条。默认显示输入标记与滚�
 
 只改变显示和滚动，不改变会话分支、模型上下文、压缩状态或输入框内容。
 
-## 试用
+## 安装与试用
 
 实现与验收基准为 **Pi 1.5.2**，开发 SDK/TUI 依赖也精确固定为 **1.5.2**。不对其他版本作兼容承诺；宿主升级后仍需重新验证内部布局能力。依赖全屏模式；regular 模式的终端原生滚动条不受本扩展控制。
+
+### 从 GitHub 安装
+
+从 [llc2214926/pi-visible-scrollbar](https://github.com/llc2214926/pi-visible-scrollbar) 安装：
+
+```sh
+pi install git:github.com/llc2214926/pi-visible-scrollbar
+```
+
+Pi 会克隆仓库、安装运行依赖，并将包来源写入用户配置。安装后重新启动 Pi，或在已运行的 Pi 会话中执行 `/reload`。使用全屏模式启动：
+
+```sh
+pi --tui-mode fullscreen
+```
+
+### 本地目录试用
 
 本地目录需要先安装依赖（Pi 不会自动安装本地目录的依赖）：
 

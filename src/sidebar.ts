@@ -114,6 +114,8 @@ export class Sidebar implements Component {
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
     const snapshot = this.rendered;
     if (!snapshot || !this.viewport.mounted) return undefined;
+    // Pi can cancel capture on focus loss without delivering a release to this component.
+    if (event.type === "press") { this.drag = undefined; this.suppressClick = false; }
     if (event.type === "wheel") { this.closePopup(); this.viewport.scrollBy(event.wheelDelta ?? 0); return { handled: true }; }
     const group = this.tracks[event.y] ?? [];
     const marker = event.x >= event.width - 3 && event.x < event.width - 1;
@@ -124,14 +126,16 @@ export class Sidebar implements Component {
     const mapGeometry = onMap || this.drag?.kind === "map"
       ? this.map.geometry ?? minimapGeometry(snapshot, miniWidth * cells.widthPx, snapshot.height * cells.heightPx) : undefined;
     if (event.type === "move") {
+      const wasDragging = !!this.drag;
+      this.drag = undefined;
+      this.suppressClick = false;
       if (marker && group.length > 1) this.openPopup(group, event);
       // Keep the popup reachable while crossing the experimental minimap to its left.
       else if (marker || onThumbLane) this.closePopup();
-      return { handled: true, render: false };
+      return { handled: true, render: wasDragging };
     }
     if (event.type === "press" && event.button === "left") {
       this.closePopup();
-      this.suppressClick = false;
       if (onMap && mapGeometry && event.y + 1 > mapGeometry.top && event.y < mapGeometry.top + mapGeometry.size) {
         this.drag = { kind: "map", grab: event.y - mapGeometry.top };
         this.suppressClick = true;
