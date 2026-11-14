@@ -17,6 +17,7 @@ export interface Snapshot {
   height: number;
   top: number;
   contentHeight: number;
+  preparing?: boolean;
 }
 
 export function label(text: string): string {

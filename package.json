@@ -1,11 +1,11 @@
 {
   "name": "pi-visible-scrollbar",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Clickable user-prompt markers for Pi's fullscreen transcript, with read-only history and an opt-in experimental minimap.",
   "type": "module",
   "license": "MIT",
   "keywords": ["pi-package", "pi-extension", "scrollbar"],
-  "files": ["index.ts", "src", "README.md", "LICENSE", "NOTICE.md"],
+  "files": ["index.ts", "src", "docs/assets", "README.md", "LICENSE", "NOTICE.md"],
   "pi": { "extensions": ["./index.ts"] },
   "engines": { "node": ">=22.19.0" },
   "peerDependencies": {

@@ -1,7 +1,7 @@
 import { sliceByColumn, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { Worker } from "node:worker_threads";
 import type { Snapshot } from "./model.ts";
-import { viewportPng } from "./png.ts";
+import { rasterPng, rectanglePng, viewportPng } from "./png.ts";
 
 const CONTENT_REFRESH_MS = 80;
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -88,6 +88,13 @@ export function minimapDragTop(pointer: number, grab: number, geometry: MiniGeom
   return geometry.travel ? Math.round(Math.max(0, Math.min(geometry.travel, pointer - grab)) * geometry.max / geometry.travel) : 0;
 }
 
+export interface MinimapLayers {
+  background: Buffer;
+  viewport: Buffer;
+  top: number;
+  fullHeight: boolean;
+}
+
 interface Request {
   key: string;
   lines: readonly string[];
@@ -99,7 +106,8 @@ interface Request {
   dark: boolean;
 }
 function sameRequest(a: Request, b?: Request): boolean {
-  return !!b && a.key === b.key && a.lines.length === b.lines.length && a.lines.every((line, i) => line === b.lines[i]);
+  return !!b && a.key === b.key && a.lines.length === b.lines.length &&
+    a.lines.every((line, i) => line === b.lines[i] && a.sourceRows[i] === b.sourceRows[i]);
 }
 
 /** One running raster job and one replaceable latest request, never a queue of old scroll positions. */
@@ -114,6 +122,8 @@ export class Minimap {
   private nextRenderAt = 0;
   private png?: Buffer;
   private pngKey = "";
+  private background?: { version: number; png: Buffer };
+  private rectangle?: { key: string; png: Buffer };
   private pixels?: Uint8Array;
   private rasterVersion = 0;
   private sourceLines?: readonly string[];
@@ -126,7 +136,28 @@ export class Minimap {
   get isPending(): boolean { return !!(this.running || this.pending || this.timer); }
 
   render(snapshot: Snapshot, width: number, height: number, dark: boolean, dragging = false): Buffer | undefined {
+    const frame = this.frame(snapshot, width, height, dark);
+    if (!frame) return undefined;
+    const pngKey = `${this.rasterVersion}:${frame.top}:${frame.bottom}:${dark}:${dragging}`;
+    if (pngKey !== this.pngKey) {
+      this.png = viewportPng(this.pixels!, frame.width, frame.height, frame.top, frame.bottom, dark, dragging);
+      this.pngKey = pngKey;
+    }
+    return this.png;
+  }
+
+  renderLayers(snapshot: Snapshot, width: number, height: number, dark: boolean, dragging = false): MinimapLayers | undefined {
+    const frame = this.frame(snapshot, width, height, dark);
+    if (!frame) return undefined;
+    if (this.background?.version !== this.rasterVersion) this.background = { version: this.rasterVersion, png: rasterPng(this.pixels!, frame.width, frame.height) };
+    const key = `${frame.width}:${frame.bottom - frame.top}:${dark}:${dragging}`;
+    if (this.rectangle?.key !== key) this.rectangle = { key, png: rectanglePng(frame.width, frame.bottom - frame.top, dark, dragging) };
+    return { background: this.background.png, viewport: this.rectangle.png, top: frame.top / frame.height, fullHeight: frame.bottom - frame.top === frame.height };
+  }
+
+  private frame(snapshot: Snapshot, width: number, height: number, dark: boolean): { width: number; height: number; top: number; bottom: number } | undefined {
     if (this.failure) throw this.failure;
+    if (snapshot.preparing) return undefined;
     [width, height] = rasterSize(width, height);
     const geometry = minimapGeometry(snapshot, width, height);
     this.geometry = geometry;
@@ -153,12 +184,7 @@ export class Minimap {
     if (!this.pixels || this.completed?.width !== width || this.completed.height !== height) return undefined;
     const top = Math.max(0, Math.min(height - 1, Math.round(geometry.top / Math.max(1, snapshot.height) * height)));
     const bottom = Math.max(top + 1, Math.min(height, Math.round((geometry.top + geometry.size) / Math.max(1, snapshot.height) * height)));
-    const pngKey = `${this.rasterVersion}:${top}:${bottom}:${dark}:${dragging}`;
-    if (pngKey !== this.pngKey) {
-      this.png = viewportPng(this.pixels, width, height, top, bottom, dark, dragging);
-      this.pngKey = pngKey;
-    }
-    return this.png;
+    return { width, height, top, bottom };
   }
 
   private schedule(): void {
@@ -232,6 +258,7 @@ export class Minimap {
     this.requested = this.pending = undefined;
     this.png = undefined;
     this.pngKey = "";
+    this.background = this.rectangle = undefined;
     this.pixels = undefined;
     this.sourceLines = undefined;
     this.completed = undefined;

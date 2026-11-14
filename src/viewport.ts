@@ -53,10 +53,13 @@ export class Viewport {
   private originalUpdate: ScrollView["updateLayout"];
   private wrappedUpdate: ScrollView["updateLayout"];
   private hadOwnUpdate: boolean;
+  private originalScrollTo: ScrollView["scrollTo"];
+  private restoreNavigation: (() => void)[] = [];
   private previousAnchors: Anchor[] = [];
   private previousTop = -1;
   private previousHeight = -1;
   private pendingId?: string;
+  private preparationBookmark?: { id: string; offset: number };
   private disposed = false;
 
   constructor(readonly tui: TUI, ctx: ExtensionContext) {
@@ -67,21 +70,58 @@ export class Viewport {
       this.failure = error instanceof Error ? error.message : String(error);
       this.dispose();
     });
+    this.originalScrollTo = scroll.scrollTo.bind(scroll);
+    // Native input is consumed before extension listeners; cancel at the shared navigation methods,
+    // including no-op Ctrl+End. Internal layout restoration uses the saved scrollTo instead.
+    const navigation = <Args extends unknown[], Result>(original: (...args: Args) => Result) => (...args: Args): Result => {
+      this.pendingId = undefined;
+      this.preparationBookmark = undefined;
+      return original.apply(scroll, args);
+    };
+    const wrappedNavigation = {
+      scrollTo: navigation(scroll.scrollTo),
+      scrollBy: navigation(scroll.scrollBy),
+      scrollToStart: navigation(scroll.scrollToStart),
+      scrollToEnd: navigation(scroll.scrollToEnd),
+    };
+    for (const key of ["scrollTo", "scrollBy", "scrollToStart", "scrollToEnd"] as const) {
+      const original = Object.getOwnPropertyDescriptor(scroll, key);
+      this.restoreNavigation.push(() => {
+        if (scroll[key] !== wrappedNavigation[key]) return;
+        if (original) Object.defineProperty(scroll, key, original);
+        else delete (scroll as Partial<ScrollView>)[key];
+      });
+    }
+    Object.assign(scroll, wrappedNavigation);
     this.originalUpdate = scroll.updateLayout;
     this.hadOwnUpdate = Object.hasOwn(scroll, "updateLayout");
     this.wrappedUpdate = (total, height, requestRender) => {
       const before = scroll.scrollTop;
       const following = scroll.isFollowingEnd;
+      if (this.preparationBookmark && (before !== this.previousTop || following)) this.preparationBookmark = undefined;
+      if (this.history.isPending && !following && !this.pendingId && !this.preparationBookmark) {
+        const anchor = nearestAnchor(this.previousAnchors, before);
+        if (anchor) this.preparationBookmark = { id: anchor.id, offset: before - anchor.row };
+      }
       const previous = !following && before === this.previousTop && this.history.anchors !== this.previousAnchors
         ? nearestAnchor(this.previousAnchors, before) : undefined;
       this.originalUpdate.call(scroll, total, height, requestRender);
-      const target = this.pendingId ? this.history.anchors.find(a => a.id === this.pendingId) : undefined;
+      if (!this.history.isPending && this.pendingId && !this.history.prompts.some(p => p.id === this.pendingId)) this.pendingId = undefined;
+      const target = !this.history.isPending && this.pendingId ? this.history.anchors.find(a => a.id === this.pendingId) : undefined;
       if (target) {
-        scroll.scrollTo(target.row, { disableFollow: true });
+        this.originalScrollTo(target.row, { disableFollow: true });
         this.pendingId = undefined;
+        this.preparationBookmark = undefined;
+      } else if (this.preparationBookmark) {
+        if (this.history.isPending) this.originalScrollTo(before, { disableFollow: true });
+        else {
+          const anchor = this.history.anchors.find(a => a.id === this.preparationBookmark!.id);
+          if (anchor) this.originalScrollTo(anchor.row + this.preparationBookmark.offset, { disableFollow: true });
+          this.preparationBookmark = undefined;
+        }
       } else if (!following && before === this.previousTop && previous) {
         const moved = this.history.anchors.find(a => a.id === previous.id);
-        if (moved) scroll.scrollTo(moved.row + before - previous.row, { disableFollow: true });
+        if (moved) this.originalScrollTo(moved.row + before - previous.row, { disableFollow: true });
       }
       this.previousTop = scroll.scrollTop;
       this.previousAnchors = this.history.anchors;
@@ -127,20 +167,23 @@ export class Viewport {
     // Remember later settings changes, but keep only our custom scrollbar visible while mounted.
     if (!this.disposed && scroll.scrollbar !== "hidden") { this.scrollbar = scroll.scrollbar; scroll.setScrollbar("hidden"); }
     return { anchors: this.history.anchors, lines: this.history.lines, width: this.history.width,
-      height: scroll.viewportHeight, top: scroll.scrollTop, contentHeight: this.history.lines.length };
+      height: scroll.viewportHeight, top: scroll.scrollTop, contentHeight: this.history.lines.length, preparing: this.history.isPending };
   }
 
   jump(id: string): boolean {
     if (!this.mounted || !this.history.prompts.some(p => p.id === id)) return false;
+    this.preparationBookmark = undefined;
     this.pendingId = id;
     const anchor = this.history.anchors.find(a => a.id === id);
-    if (anchor) { this.mount.scroll.scrollTo(anchor.row, { disableFollow: true }); this.pendingId = undefined; }
+    if (anchor) {
+      this.originalScrollTo(anchor.row, { disableFollow: true });
+      if (!this.history.isPending) this.pendingId = undefined;
+    }
     this.tui.requestRender();
     return true;
   }
 
   scrollTo(row: number, immediate = false): void {
-    this.pendingId = undefined;
     const scroll = this.mount.scroll, before = scroll.scrollTop, following = scroll.isFollowingEnd;
     scroll.scrollTo(row);
     if (scroll.scrollTop === before && scroll.isFollowingEnd === following) return;
@@ -150,8 +193,8 @@ export class Viewport {
     if (immediate && typeof host.requestImmediateRender === "function") host.requestImmediateRender();
     else this.tui.requestRender();
   }
-  scrollBy(delta: number): void { this.pendingId = undefined; this.mount.scroll.scrollBy(delta); this.tui.requestRender(); }
-  end(): void { this.pendingId = undefined; this.mount.scroll.scrollToEnd(); this.tui.requestRender(); }
+  scrollBy(delta: number): void { this.mount.scroll.scrollBy(delta); this.tui.requestRender(); }
+  end(): void { this.mount.scroll.scrollToEnd(); this.tui.requestRender(); }
   refresh(): void { this.history.invalidate(); this.tui.requestRender(); }
 
   dispose(): void {
@@ -159,6 +202,7 @@ export class Viewport {
     this.disposed = true;
     const { scroll, entry, parent } = this.mount;
     this.history.dispose();
+    for (const restore of this.restoreNavigation.splice(0)) restore();
     if (scroll.updateLayout === this.wrappedUpdate) {
       if (this.hadOwnUpdate) scroll.updateLayout = this.originalUpdate;
       else delete (scroll as Partial<ScrollView>).updateLayout;

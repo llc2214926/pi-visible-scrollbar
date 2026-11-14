@@ -1,7 +1,8 @@
 import * as host from "@earendil-works/pi-coding-agent";
-import { Container, Spacer, Text, stripTerminalSequences, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text, stripTerminalSequences, type Component, type TUI } from "@earendil-works/pi-tui";
 import { randomUUID } from "node:crypto";
 import { label, type Anchor, type Prompt } from "./model.ts";
+import { ArchivedHistory } from "./archive.ts";
 
 type Entry = host.SessionEntry;
 interface NativeFields {
@@ -88,44 +89,6 @@ function boundaries(children: readonly Component[]): Boundary[] {
   return result;
 }
 
-class ArchivedHistory extends Container {
-  private cached?: { width: number; lines: string[] };
-  constructor(private collecting: () => boolean) { super(); }
-  clearCache(): void { this.cached = undefined; }
-  invalidate(): void { this.clearCache(); super.invalidate(); }
-  render(width: number): string[] {
-    // Archived entries are immutable; expansions and theme/mouse changes invalidate this display cache.
-    // Never reuse private anchor markers outside the document's collection pass.
-    if (!this.collecting()) { this.clearCache(); return super.render(width); }
-    if (this.cached?.width === width) return this.cached.lines;
-    const lines = super.render(width);
-    this.cached = { width, lines };
-    return lines;
-  }
-  addChild(component: Component): void {
-    const watch = (child: Component) => {
-      if (child instanceof host.ToolExecutionComponent || child instanceof host.SkillInvocationMessageComponent || child instanceof host.CustomMessageComponent) {
-        const original = child.setExpanded;
-        child.setExpanded = expanded => { this.clearCache(); original.call(child, expanded); };
-      } else if (child.constructor === Container) (child as Container).children.forEach(watch);
-    };
-    watch(component); this.clearCache(); super.addChild(component);
-  }
-  handleMouse(event: TuiMouseEvent) {
-    const result = super.handleMouse(event);
-    if (event.type !== "move" || (result && result.render !== false)) this.clearCache();
-    return result;
-  }
-  setExpanded(expanded: boolean): void {
-    this.clearCache();
-    const visit = (component: Component) => {
-      if (component instanceof host.ToolExecutionComponent || component instanceof host.SkillInvocationMessageComponent || component instanceof host.CustomMessageComponent) component.setExpanded(expanded);
-      else if (component.constructor === Container) (component as Container).children.forEach(visit);
-    };
-    this.children.forEach(visit);
-  }
-}
-
 /** Display-only supplementation. Never writes session entries or changes the active leaf. */
 export class History {
   anchors: Anchor[] = [];
@@ -133,11 +96,17 @@ export class History {
   width = 0;
   prompts: Prompt[] = [];
   private branch: Entry[] = [];
+  private signatures: (string | undefined)[] = [];
+  private promptById = new Map<string, Prompt>();
+  private supplements = new Map<string, Component>();
   private leaf: string | null | undefined;
   private rawChildren: Component[] = [];
-  private archiveCache?: { key: string; component: ArchivedHistory; users: Map<Component, Prompt> };
+  private archiveCache?: { key: string; count: number; lastId: string; component: ArchivedHistory; users: Map<Component, Prompt>; tools: Map<string, host.ToolExecutionComponent>; footer: Component };
+  private preparationError?: Error;
   private owned = new Set<Component>();
-  private bound = new Map<Component, { original: Component["render"]; wrapped: Component["render"]; own: boolean }>();
+  private bound = new Map<Component, { original: Component["render"]; wrapped: Component["render"]; own: boolean; token: number; id: string }>();
+  private bindingPass = new Set<Component>();
+  private tokenSerial = 0;
   private tokens = new Map<number, Prompt>();
   private collecting = false;
   private dirty = true;
@@ -164,34 +133,60 @@ export class History {
       let rendered: string[];
       try { rendered = this.originalRender.call(document, width); }
       finally { this.collecting = false; }
-      const cached = this.renderCache;
-      if (cached?.width === width && rendered.length === cached.marked.length && rendered.every((line, i) => line === cached.marked[i])) return cached.clean;
-      const found = new Map<number, Anchor>();
-      const clean = rendered.map((line, row) => {
-        if (!line.includes(this.marker)) return line;
-        return line.replace(this.markerPattern, (_match, side: string, key: string) => {
-          const token = Number(key), prompt = this.tokens.get(token);
-          if (prompt) {
-            if (side === "s") found.set(token, { ...prompt, row, end: row + 1 });
-            else { const anchor = found.get(token); if (anchor) anchor.end = row + 1; }
-          }
-          return "";
-        });
-      });
-      this.anchors = [...found.values()].sort((a, b) => a.row - b.row);
-      this.lines = clean;
-      this.width = width;
-      this.renderCache = { width, marked: rendered.slice(), clean };
-      return clean;
+      return this.collectLines(rendered, width);
     };
     document.render = this.wrappedRender;
   }
 
+  private collectLines(rendered: string[], width: number): string[] {
+    const cached = this.renderCache;
+    let from = 0, oldEnd = cached?.marked.length ?? 0, end = rendered.length;
+    if (cached?.width === width) {
+      while (from < Math.min(oldEnd, end) && rendered[from] === cached.marked[from]) from++;
+      if (from === oldEnd && from === end) return cached.clean;
+      while (oldEnd > from && end > from && rendered[end - 1] === cached.marked[oldEnd - 1]) { oldEnd--; end--; }
+      // A changed middle line must include both markers of the user card that encloses it.
+      const first = this.anchors.find(anchor => anchor.end > from);
+      if (first && first.row < from) from = first.row;
+      const last = this.anchors.find(anchor => anchor.row < oldEnd && anchor.end > oldEnd);
+      if (last) { end += last.end - oldEnd; oldEnd = last.end; }
+    }
+    const found = new Map<number, Anchor>();
+    const middle = rendered.slice(from, end).map((line, index) => {
+      if (!line.includes(this.marker)) return line;
+      const row = from + index;
+      return line.replace(this.markerPattern, (_match, side: string, key: string) => {
+        const token = Number(key), prompt = this.tokens.get(token);
+        if (prompt) {
+          if (side === "s") found.set(token, { ...prompt, row, end: row + 1 });
+          else { const anchor = found.get(token); if (anchor) anchor.end = row + 1; }
+        }
+        return "";
+      });
+    });
+    const clean = (cached?.clean.slice(0, from) ?? []).concat(middle, cached?.clean.slice(oldEnd) ?? []);
+    const delta = end - oldEnd;
+    const anchors = (cached ? this.anchors.filter(anchor => anchor.end <= from) : []).concat(
+      [...found.values()],
+      cached ? this.anchors.filter(anchor => anchor.row >= oldEnd).map(anchor => delta ? { ...anchor, row: anchor.row + delta, end: anchor.end + delta } : anchor) : [],
+    );
+    if (anchors.length !== this.anchors.length || anchors.some((anchor, i) => anchor.id !== this.anchors[i].id || anchor.row !== this.anchors[i].row || anchor.end !== this.anchors[i].end)) this.anchors = anchors;
+    this.lines = clean;
+    this.width = width;
+    this.renderCache = { width, marked: rendered.slice(), clean };
+    return clean;
+  }
+
+  get isPending(): boolean { return this.archiveCache?.component.isPending ?? false; }
   invalidate(): void { this.dirty = true; }
 
   private bind(component: Component, prompt: Prompt): void {
+    this.bindingPass.add(component);
+    const previous = this.bound.get(component);
+    if (previous?.id === prompt.id && component.render === previous.wrapped) return;
+    if (previous) this.unbind(new Set([...this.bound.keys()].filter(c => c !== component)));
     const original = component.render;
-    const token = this.tokens.size;
+    const token = this.tokenSerial++;
     this.tokens.set(token, prompt);
     let cached: { source: string[]; marked: string[] } | undefined;
     const wrapped = (width: number) => {
@@ -204,18 +199,21 @@ export class History {
       cached = { source: lines.slice(), marked };
       return marked;
     };
-    this.bound.set(component, { original, wrapped, own: Object.hasOwn(component, "render") });
+    this.bound.set(component, { original, wrapped, own: Object.hasOwn(component, "render"), token, id: prompt.id });
     component.render = wrapped;
   }
 
-  private unbind(): void {
+  private unbind(keep?: ReadonlySet<Component>): void {
     for (const [component, binding] of this.bound) {
-      if (component.render !== binding.wrapped) continue;
-      if (binding.own) component.render = binding.original;
-      else delete (component as Partial<Component>).render;
+      if (keep?.has(component)) continue;
+      if (component.render === binding.wrapped) {
+        if (binding.own) component.render = binding.original;
+        else delete (component as Partial<Component>).render;
+      }
+      this.bound.delete(component);
+      this.tokens.delete(binding.token);
+      this.renderCache = undefined;
     }
-    this.bound.clear();
-    this.tokens.clear();
   }
 
   private makeUser(entry: Entry, prompt: Prompt): Component {
@@ -231,18 +229,35 @@ export class History {
   }
 
   private archive(entries: Entry[], prompts: Map<string, Prompt>): Container {
-    const key = entries.map(e => e.id).join(":");
+    // Session entries are immutable, and the final ID identifies its entire parent chain.
+    const key = `${entries.length}:${entries.at(-1)?.id ?? ""}`;
     if (this.archiveCache?.key === key) {
-      this.archiveCache.component.clearCache(); // Rebinding can change marker tokens even when visible text is identical.
       for (const [component, prompt] of this.archiveCache.users) this.bind(component, prompt);
       return this.archiveCache.component;
     }
-    const archive = new ArchivedHistory(() => this.collecting);
-    const users = new Map<Component, Prompt>();
-    if (!entries.some(e => userText(e) !== undefined)) return archive;
-    archive.addChild(new Text(" Earlier history · read-only · model context unchanged", 0, 1));
-    const tools = new Map<string, host.ToolExecutionComponent>();
-    for (const entry of entries) {
+    if (!entries.some(e => userText(e) !== undefined)) {
+      this.archiveCache?.component.dispose();
+      this.archiveCache = undefined;
+      return new Container();
+    }
+    const previous = this.archiveCache;
+    const extending = previous && entries.length > previous.count && entries[previous.count - 1]?.id === previous.lastId;
+    const archive = extending ? previous.component : new ArchivedHistory(
+      () => this.collecting,
+      render => { const wasCollecting = this.collecting; this.collecting = true; try { return render(); } finally { this.collecting = wasCollecting; } },
+      () => { if (!this.disposed) this.tui.requestRender(); },
+      error => { if (!this.disposed) { this.preparationError = error instanceof Error ? error : new Error(String(error)); this.tui.requestRender(); } },
+    );
+    const users = extending ? previous.users : new Map<Component, Prompt>();
+    const tools = extending ? previous.tools : new Map<string, host.ToolExecutionComponent>();
+    if (extending) {
+      archive.removeChild(previous.footer);
+      for (const [component, prompt] of users) this.bind(component, prompt);
+    } else {
+      previous?.component.dispose();
+      archive.addChild(new Text(" Earlier history · read-only · model context unchanged", 0, 1));
+    }
+    for (const entry of entries.slice(extending ? previous.count : 0)) {
       const prompt = prompts.get(entry.id);
       if (prompt) {
         const component = this.makeUser(entry, prompt);
@@ -272,29 +287,41 @@ export class History {
         }
       }
     }
-    archive.addChild(new Text(" End of earlier history", 0, 1));
-    this.archiveCache = { key, component: archive, users };
+    const footer = new Text(" End of earlier history", 0, 1);
+    archive.addChild(footer);
+    this.archiveCache = { key, count: entries.length, lastId: entries.at(-1)!.id, component: archive, users, tools, footer };
     return archive;
   }
 
   private sync(): void {
     if (this.disposed) return;
+    if (this.preparationError) throw this.preparationError;
     const leaf = this.ctx.sessionManager.getLeafId();
     const raw = this.chat.children.filter(c => !this.owned.has(c));
     const changed = raw.length !== this.rawChildren.length || raw.some((c, i) => c !== this.rawChildren[i]);
     if (!this.dirty && leaf === this.leaf && !changed) return;
-    this.renderCache = undefined; // Identical text can acquire different entry IDs after a branch rebuild.
+    const branch = this.ctx.sessionManager.getBranch();
+    const appendOnly = this.branch.length <= branch.length && this.branch.every((entry, i) => entry.id === branch[i].id);
     this.dirty = false;
     this.leaf = leaf;
+    if (appendOnly && branch.length === this.branch.length && !changed) return;
+    const from = appendOnly ? this.branch.length : 0;
+    if (!appendOnly) { this.promptById.clear(); this.signatures = []; }
+    const added: Prompt[] = [];
+    for (let i = from; i < branch.length; i++) {
+      const prompt = promptFor(branch[i], i);
+      if (prompt) { added.push(prompt); this.promptById.set(prompt.id, prompt); }
+      this.signatures.push(entrySignature(branch[i]));
+    }
+    if (!appendOnly || added.length) this.prompts = [...(appendOnly ? this.prompts : []), ...added];
+    this.branch = branch;
     this.rawChildren = raw;
-    this.branch = this.ctx.sessionManager.getBranch();
-    this.prompts = this.branch.flatMap((e, i) => { const prompt = promptFor(e, i); return prompt ? [prompt] : []; });
-    const prompts = new Map(this.prompts.map(p => [p.id, p]));
-    this.unbind();
+    const prompts = this.promptById;
+    this.bindingPass.clear();
     this.chat.children = raw.slice();
     this.owned.clear();
     const native = boundaries(raw);
-    const signatures = this.branch.map(entrySignature);
+    const signatures = this.signatures;
     const matches: { boundary: Boundary; index: number }[] = [];
     let cursor = this.branch.length - 1;
     // Backward matching distinguishes repeated identical prompts in a retained suffix.
@@ -313,20 +340,31 @@ export class History {
     const additions = new Map<number, Component[]>();
     const add = (slot: number, component: Component) => {
       this.owned.add(component);
-      additions.set(slot, [...(additions.get(slot) ?? []), component]);
+      const list = additions.get(slot);
+      if (list) list.push(component);
+      else additions.set(slot, [component]);
     };
     const archive = this.archive(this.branch.slice(0, prefixEnd), prompts);
     if (archive.children.length) add(0, archive);
     const present = new Set(matches.filter(m => m.boundary.prompt).map(m => this.branch[m.index].id));
+    const matched = new Set(matches.map(m => m.boundary));
+    const streaming = native.filter(n => !matched.has(n) && n.signature.startsWith("assistant:"));
+    let nextIndex = 0;
     for (const prompt of this.prompts) {
       if (prompt.entryIndex < prefixEnd || present.has(prompt.id)) continue;
-      // Pi does not render image-only inputs. Give each one its own chronological anchor.
-      const next = matches.find(m => m.index > prompt.entryIndex);
+      // Pi does not render image-only inputs. Walk the sorted matches once, not once per input.
+      while (nextIndex < matches.length && matches[nextIndex].index <= prompt.entryIndex) nextIndex++;
+      const next = matches[nextIndex];
       const entry = this.branch[prompt.entryIndex];
       const timestamp = entry.type === "message" ? entry.message.timestamp : Infinity;
-      const streaming = native.find(n => !matches.some(m => m.boundary === n) && n.signature.startsWith("assistant:") && Number(n.signature.slice(10)) >= timestamp);
-      add(next?.boundary.slot ?? streaming?.slot ?? raw.length, this.makeUser(entry, prompt));
+      const pending = next ? undefined : streaming.find(n => Number(n.signature.slice(10)) >= timestamp);
+      const component = this.supplements.get(prompt.id) ?? this.makeUser(entry, prompt);
+      this.supplements.set(prompt.id, component);
+      this.bind(component, prompt);
+      add(next?.boundary.slot ?? pending?.slot ?? raw.length, component);
     }
+    for (const [id, component] of this.supplements) if (!this.owned.has(component)) this.supplements.delete(id);
+    this.unbind(this.bindingPass);
     this.chat.children = raw.flatMap((component, i) => [...(additions.get(i) ?? []), component]);
     this.chat.children.push(...(additions.get(raw.length) ?? []));
   }
@@ -334,6 +372,7 @@ export class History {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.archiveCache?.component.dispose();
     this.unbind();
     this.chat.children = this.chat.children.filter(c => !this.owned.has(c));
     this.owned.clear();
@@ -343,6 +382,13 @@ export class History {
     }
     this.lines = [];
     this.anchors = [];
+    this.prompts = [];
+    this.branch = [];
+    this.signatures = [];
+    this.rawChildren = [];
+    this.promptById.clear();
+    this.supplements.clear();
+    this.bindingPass.clear();
     this.archiveCache = undefined;
     this.renderCache = undefined;
   }

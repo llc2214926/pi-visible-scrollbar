@@ -88,7 +88,8 @@ export default function visibleScrollbar(pi: ExtensionAPI): void {
         const total = active?.viewport.history.prompts.length ?? 0;
         const minimap = active?.sidebar.minimapStatus ?? (config.experimentalMinimap ? "on, not mounted" : "off");
         const error = failure || active?.sidebar.minimapFailure;
-        ctx.ui.notify(`Visible scrollbar: ${config.enabled ? "on" : "off"}; ${active?.viewport.mounted ? "mounted" : "not mounted"}; inputs ${rendered}/${total}; experimental minimap ${minimap}.\n${error || configPath()}`, error ? "warning" : "info");
+        const preparing = active?.viewport.history.isPending ? "; preparing history layout" : "";
+        ctx.ui.notify(`Visible scrollbar: ${config.enabled ? "on" : "off"}; ${active?.viewport.mounted ? "mounted" : "not mounted"}; inputs ${rendered}/${total}${preparing}; experimental minimap ${minimap}.\n${error || configPath()}`, error ? "warning" : "info");
         return;
       }
       if (["on", "off", "minimap on", "minimap off"].includes(action)) {

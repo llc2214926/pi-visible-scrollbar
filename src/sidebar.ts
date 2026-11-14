@@ -39,9 +39,15 @@ export class Sidebar implements Component {
     if (this.experimentalMinimap && !protocol) this.warn("Pixel minimap needs iTerm2 or Kitty graphics in a direct terminal. Input markers remain available; no dot-map fallback is used.");
     if (enabled && !this.graphics) {
       try {
-        this.graphics = new GraphicMinimap(this.viewport.tui, this, (width, height) =>
-          this.map.render(this.viewport.snapshot(), width, height, this.ctx.ui.theme.appearance === "dark", this.drag?.kind === "map"),
-          error => this.failMinimap(error));
+        this.graphics = new GraphicMinimap(this.viewport.tui, this, (width, height, protocol) => {
+          const snapshot = this.viewport.snapshot(), dark = this.ctx.ui.theme.appearance === "dark", dragging = this.drag?.kind === "map";
+          if (protocol === "kitty") {
+            const layers = this.map.renderLayers(snapshot, width, height, dark, dragging);
+            return layers ? { protocol, layers } : undefined;
+          }
+          const png = this.map.render(snapshot, width, height, dark, dragging);
+          return png ? { protocol, png } : undefined;
+        }, error => this.failMinimap(error));
       } catch (error) { this.failMinimap(error); }
     } else if (!enabled && this.graphics) { this.graphics.dispose(); this.graphics = undefined; this.map.dispose(); }
     const proportional = enabled && !this.minimapFailure;

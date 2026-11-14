@@ -1,4 +1,8 @@
-import { allocateImageId, deleteKittyImage, encodeITerm2, encodeKitty, getCapabilities, getCellDimensions, sliceByColumn, visibleWidth, type Component, type ImageProtocol, type TUI } from "@earendil-works/pi-tui";
+import { encodeITerm2, getCapabilities, getCellDimensions, sliceByColumn, visibleWidth, type Component, type ImageProtocol, type TUI } from "@earendil-works/pi-tui";
+import { KittyLayers } from "./kitty.ts";
+import type { MinimapLayers } from "./minimap.ts";
+
+type GraphicImage = { protocol: "iterm2"; png: Buffer } | { protocol: "kitty"; layers: MinimapLayers };
 
 const BEGIN = "\x1b[?2026h", END = "\x1b[?2026l", SAVE = "\x1b7", RESTORE = "\x1b8";
 const isImageLine = (line: string) => line.includes("\x1b_G") || line.includes("\x1b]1337;File=");
@@ -28,19 +32,27 @@ export class GraphicMinimap {
   private original: Renderer["doRender"];
   private wrapped: Renderer["doRender"];
   private hadOwn: boolean;
-  private imageId = allocateImageId();
+  private kitty?: KittyLayers;
+  private removeInput: () => void;
   private painted = false;
   private lastImage?: Buffer;
   private lastBox = "";
   private queriedSize = "";
   private disposed = false;
 
-  constructor(private tui: TUI, private component: Component, private png: (width: number, height: number) => Buffer | undefined, private failed: (error: unknown) => void) {
+  constructor(private tui: TUI, private component: Component, private png: (width: number, height: number, protocol: Exclude<ImageProtocol, null>) => GraphicImage | undefined, private failed: (error: unknown) => void) {
     this.tui = tui.valueOf() as TUI;
     const host = renderer(this.tui);
     if (typeof host.doRender !== "function" || typeof host.resetRenderState !== "function" || typeof host.getScreenLines !== "function") throw new Error("Pi 1.5.2 frame compositor is unavailable.");
     this.original = host.doRender;
     this.hadOwn = Object.hasOwn(host, "doRender");
+    this.removeInput = this.tui.addInputListener(data => {
+      const reply = this.kitty?.response(data);
+      if (!reply) return undefined;
+      if (reply.retry) this.tui.requestRender();
+      if (reply.error) queueMicrotask(() => { if (!this.disposed) this.failed(new Error(reply.error)); });
+      return { consume: true };
+    });
     this.wrapped = () => {
       if (this.disposed) { this.original.call(host); return; }
       // Remove the image before modal UI paints; a forced frame also restores unchanged overlay rows.
@@ -59,8 +71,7 @@ export class GraphicMinimap {
       try {
         if (!this.disposed) {
           if (this.tui.hasOverlay()) {
-            if (this.painted && minimapProtocol(this.tui) === "kitty") sequence = deleteKittyImage(this.imageId);
-            this.painted = false;
+            sequence = this.clearImage();
           } else sequence = this.draw(before, frame);
         }
       } catch (error) {
@@ -81,9 +92,8 @@ export class GraphicMinimap {
     const box = root && visit(root);
     if (!protocol || !box || box.rect.width <= 3 || box.rect.height < 1) {
       if (this.painted) {
-        this.painted = false;
         this.tui.requestRender(true);
-        return protocol === "kitty" ? deleteKittyImage(this.imageId) : "";
+        return this.clearImage();
       }
       return "";
     }
@@ -94,26 +104,30 @@ export class GraphicMinimap {
     // Fullscreen Pi skips this query for iTerm2 after disabling generic images. Its normal input
     // handler still consumes the reply and updates cell dimensions; do not change capabilities.
     const cells = getCellDimensions();
-    const image = this.png(width * cells.widthPx, height * cells.heightPx);
+    const image = this.png(width * cells.widthPx, height * cells.heightPx, protocol);
     if (!image) {
       if (!this.painted) return query;
-      this.painted = false;
       if (!cleared) this.tui.requestRender(true);
-      return query + (protocol === "kitty" ? deleteKittyImage(this.imageId) : "");
+      return query + this.clearImage();
     }
     const after = renderer(this.tui).getScreenLines();
     const position = `${x}:${y}:${width}:${height}`;
     const preserved = this.painted && !cleared && this.lastBox === position &&
       this.preserveImage(frame, before, after, x, y, width, height);
-    if (preserved && this.lastImage === image) return query;
-    const remove = this.painted && protocol === "kitty" ? deleteKittyImage(this.imageId) : "";
+    if (image.protocol === "kitty") {
+      this.kitty ??= new KittyLayers();
+      const sequence = this.kitty.draw(image.layers, { x, y, width, height }, cells, preserved, cleared);
+      this.painted = true;
+      this.lastImage = undefined;
+      this.lastBox = position;
+      return sequence ? `${query}${SAVE}${sequence}${RESTORE}` : query;
+    }
+    if (preserved && this.lastImage === image.png) return query;
+    const remove = this.kitty?.clear() ?? "";
     this.painted = true;
-    this.lastImage = image;
+    this.lastImage = image.png;
     this.lastBox = position;
-    const base64 = image.toString("base64");
-    const sequence = protocol === "kitty"
-      ? encodeKitty(base64, { columns: width, rows: height, imageId: this.imageId, moveCursor: false })
-      : encodeITerm2(base64, { width, height, preserveAspectRatio: false, inline: true });
+    const sequence = encodeITerm2(image.png.toString("base64"), { width, height, preserveAspectRatio: false, inline: true });
     // Exact cell bounds are essential: preserveAspectRatio can silently letterbox the image
     // when terminal metrics are rounded or a cell-size reply has not arrived yet.
     return `${query}${SAVE}${remove}\x1b[${y + 1};${x + 1}H${sequence}${RESTORE}`;
@@ -138,6 +152,12 @@ export class GraphicMinimap {
     return preserved;
   }
 
+  private clearImage(): string {
+    this.painted = false;
+    this.lastImage = undefined;
+    return this.kitty?.clear() ?? "";
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -146,8 +166,9 @@ export class GraphicMinimap {
       if (this.hadOwn) host.doRender = this.original;
       else delete (host as Partial<Renderer>).doRender;
     }
-    if (this.painted && minimapProtocol(this.tui) === "kitty") this.tui.terminal.write(`${BEGIN}${deleteKittyImage(this.imageId)}${END}`);
-    this.painted = false;
+    this.removeInput();
+    const clear = this.clearImage();
+    if (clear) this.tui.terminal.write(`${BEGIN}${clear}${END}`);
     this.tui.requestRender(true);
   }
 }

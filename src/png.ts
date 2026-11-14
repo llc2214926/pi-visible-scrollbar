@@ -11,11 +11,15 @@ function chunk(type: string, data: Buffer): Buffer {
   return result;
 }
 
-/** Paint only the viewport over an immutable raster; no font shaping or worker round-trip on drag. */
-export function viewportPng(pixels: Uint8Array, width: number, height: number, top: number, bottom: number, dark: boolean, dragging: boolean): Buffer {
-  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width > 1024 || height > 4096 || pixels.byteLength !== width * height * 4) {
+function dimensions(width: number, height: number): void {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width > 1024 || height > 4096) {
     throw new Error("Invalid minimap raster dimensions");
   }
+}
+
+function scanlines(pixels: Uint8Array, width: number, height: number): Buffer {
+  dimensions(width, height);
+  if (pixels.byteLength !== width * height * 4) throw new Error("Invalid minimap raster dimensions");
   const stride = width * 4;
   const scan = Buffer.allocUnsafe((stride + 1) * height);
   const source = Buffer.from(pixels.buffer, pixels.byteOffset, pixels.byteLength);
@@ -23,6 +27,38 @@ export function viewportPng(pixels: Uint8Array, width: number, height: number, t
     scan[y * (stride + 1)] = 0; // PNG's None filter keeps this pass a straight row copy.
     source.copy(scan, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
   }
+  return scan;
+}
+
+function encode(scan: Buffer, width: number, height: number): Buffer {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0); header.writeUInt32BE(height, 4);
+  header[8] = 8; header[9] = 6; // 8-bit RGBA, no interlacing.
+  return Buffer.concat([SIGNATURE, chunk("IHDR", header), chunk("IDAT", deflateSync(scan, { level: 3 })), END]);
+}
+
+export function rasterPng(pixels: Uint8Array, width: number, height: number): Buffer {
+  return encode(scanlines(pixels, width, height), width, height);
+}
+
+/** A reusable transparent layer: terminal alpha blending matches the iTerm2 composite below. */
+export function rectanglePng(width: number, height: number, dark: boolean, dragging: boolean): Buffer {
+  dimensions(width, height);
+  const pixels = Buffer.alloc(width * height * 4);
+  const left = width > 2 ? 1 : 0, right = width > 2 ? width - 2 : width - 1;
+  const fill = dark ? 121 : 153, border = dark ? 160 : 119, alpha = dragging ? 140 : 77;
+  for (let y = 0; y < height; y++) for (let x = left; x <= right; x++) {
+    const offset = (y * width + x) * 4;
+    const edge = x === left || x === right || y === 0 || y === height - 1;
+    pixels.fill(edge ? border : fill, offset, offset + 3);
+    pixels[offset + 3] = edge ? 255 : alpha;
+  }
+  return rasterPng(pixels, width, height);
+}
+
+/** Paint only the viewport over an immutable raster; no font shaping or worker round-trip on drag. */
+export function viewportPng(pixels: Uint8Array, width: number, height: number, top: number, bottom: number, dark: boolean, dragging: boolean): Buffer {
+  const scan = scanlines(pixels, width, height), stride = width * 4;
   top = Math.max(0, Math.min(height - 1, Math.round(top)));
   bottom = Math.max(top + 1, Math.min(height, Math.round(bottom)));
   const left = width > 2 ? 1 : 0, right = width > 2 ? width - 2 : width - 1;
@@ -32,8 +68,5 @@ export function viewportPng(pixels: Uint8Array, width: number, height: number, t
     const edge = x === left || x === right || y === top || y === bottom - 1;
     for (let c = 0; c < 3; c++) scan[offset + c] = edge ? border : Math.round((scan[offset + c] * (255 - alpha) + fill * alpha) / 255);
   }
-  const header = Buffer.alloc(13);
-  header.writeUInt32BE(width, 0); header.writeUInt32BE(height, 4);
-  header[8] = 8; header[9] = 6; // 8-bit RGBA, no interlacing.
-  return Buffer.concat([SIGNATURE, chunk("IHDR", header), chunk("IDAT", deflateSync(scan, { level: 3 })), END]);
+  return encode(scan, width, height);
 }
