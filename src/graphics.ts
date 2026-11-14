@@ -1,0 +1,153 @@
+import { allocateImageId, deleteKittyImage, encodeITerm2, encodeKitty, getCapabilities, getCellDimensions, sliceByColumn, visibleWidth, type Component, type ImageProtocol, type TUI } from "@earendil-works/pi-tui";
+
+const BEGIN = "\x1b[?2026h", END = "\x1b[?2026l", SAVE = "\x1b7", RESTORE = "\x1b8";
+const isImageLine = (line: string) => line.includes("\x1b_G") || line.includes("\x1b]1337;File=");
+interface Box { component: Component; rect: { x: number; y: number; width: number; height: number }; children: Box[] }
+interface Renderer {
+  doRender(): void;
+  resetRenderState(): void;
+  getScreenLines(): string[];
+  currentLayout?: { root: Box };
+  imageProtocol?: ImageProtocol;
+}
+function renderer(tui: TUI): Renderer {
+  // Pi 1.5.2's stable proxy binds every method, including valueOf, to the real renderer.
+  // Hook that instance: proxy reads wrap functions and proxy deletes do not reach the host.
+  return tui.valueOf() as Renderer;
+}
+
+export function minimapProtocol(tui: TUI): ImageProtocol {
+  if (process.env.TMUX !== undefined || process.env.ZELLIJ !== undefined || process.env.STY !== undefined || /^(tmux|screen)/i.test(process.env.TERM ?? "")) return null;
+  // Fullscreen Pi disables generic iTerm images after saving its negotiated imageProtocol.
+  const protocol = renderer(tui).imageProtocol ?? getCapabilities().images;
+  return protocol === "kitty" || protocol === "iterm2" ? protocol : null;
+}
+
+/** Append only our reserved image cells to Pi's existing synchronized frame; never run another TUI. */
+export class GraphicMinimap {
+  private original: Renderer["doRender"];
+  private wrapped: Renderer["doRender"];
+  private hadOwn: boolean;
+  private imageId = allocateImageId();
+  private painted = false;
+  private lastImage?: Buffer;
+  private lastBox = "";
+  private queriedSize = "";
+  private disposed = false;
+
+  constructor(private tui: TUI, private component: Component, private png: (width: number, height: number) => Buffer | undefined, private failed: (error: unknown) => void) {
+    this.tui = tui.valueOf() as TUI;
+    const host = renderer(this.tui);
+    if (typeof host.doRender !== "function" || typeof host.resetRenderState !== "function" || typeof host.getScreenLines !== "function") throw new Error("Pi 1.5.2 frame compositor is unavailable.");
+    this.original = host.doRender;
+    this.hadOwn = Object.hasOwn(host, "doRender");
+    this.wrapped = () => {
+      if (this.disposed) { this.original.call(host); return; }
+      // Remove the image before modal UI paints; a forced frame also restores unchanged overlay rows.
+      const overlays = this.tui.hasOverlay();
+      if (overlays && this.painted) host.resetRenderState();
+      const before = host.getScreenLines();
+      const terminal = this.tui.terminal, write = terminal.write, packets: string[] = [];
+      const collect = (data: string) => { packets.push(data); };
+      terminal.write = collect;
+      try { this.original.call(host); }
+      catch (error) { write.call(terminal, packets.join("")); throw error; }
+      finally { if (terminal.write === collect) terminal.write = write; }
+      if (!packets.length) return;
+      const frame = { output: packets.join("") };
+      let sequence = "";
+      try {
+        if (!this.disposed) {
+          if (this.tui.hasOverlay()) {
+            if (this.painted && minimapProtocol(this.tui) === "kitty") sequence = deleteKittyImage(this.imageId);
+            this.painted = false;
+          } else sequence = this.draw(before, frame);
+        }
+      } catch (error) {
+        this.failed(error);
+      }
+      const end = frame.output.lastIndexOf(END);
+      if (sequence && end >= 0) frame.output = frame.output.slice(0, end) + sequence + frame.output.slice(end);
+      write.call(terminal, frame.output);
+    };
+    host.doRender = this.wrapped;
+  }
+
+  private draw(before: string[], frame: { output: string }): string {
+    const cleared = frame.output.includes("\x1b[2J") || /\x1b_Ga=d,d=[aA],/.test(frame.output);
+    const protocol = minimapProtocol(this.tui);
+    const root = renderer(this.tui).currentLayout?.root;
+    const visit = (box: Box): Box | undefined => box.component === this.component ? box : box.children.map(visit).find(Boolean);
+    const box = root && visit(root);
+    if (!protocol || !box || box.rect.width <= 3 || box.rect.height < 1) {
+      if (this.painted) {
+        this.painted = false;
+        this.tui.requestRender(true);
+        return protocol === "kitty" ? deleteKittyImage(this.imageId) : "";
+      }
+      return "";
+    }
+    const { x, y, height } = box.rect, width = box.rect.width - 3;
+    const terminalSize = `${this.tui.terminal.columns}:${this.tui.terminal.rows}`;
+    const query = terminalSize !== this.queriedSize ? "\x1b[16t" : "";
+    this.queriedSize = terminalSize;
+    // Fullscreen Pi skips this query for iTerm2 after disabling generic images. Its normal input
+    // handler still consumes the reply and updates cell dimensions; do not change capabilities.
+    const cells = getCellDimensions();
+    const image = this.png(width * cells.widthPx, height * cells.heightPx);
+    if (!image) {
+      if (!this.painted) return query;
+      this.painted = false;
+      if (!cleared) this.tui.requestRender(true);
+      return query + (protocol === "kitty" ? deleteKittyImage(this.imageId) : "");
+    }
+    const after = renderer(this.tui).getScreenLines();
+    const position = `${x}:${y}:${width}:${height}`;
+    const preserved = this.painted && !cleared && this.lastBox === position &&
+      this.preserveImage(frame, before, after, x, y, width, height);
+    if (preserved && this.lastImage === image) return query;
+    const remove = this.painted && protocol === "kitty" ? deleteKittyImage(this.imageId) : "";
+    this.painted = true;
+    this.lastImage = image;
+    this.lastBox = position;
+    const base64 = image.toString("base64");
+    const sequence = protocol === "kitty"
+      ? encodeKitty(base64, { columns: width, rows: height, imageId: this.imageId, moveCursor: false })
+      : encodeITerm2(base64, { width, height, preserveAspectRatio: false, inline: true });
+    // Exact cell bounds are essential: preserveAspectRatio can silently letterbox the image
+    // when terminal metrics are rounded or a cell-size reply has not arrived yet.
+    return `${query}${SAVE}${remove}\x1b[${y + 1};${x + 1}H${sequence}${RESTORE}`;
+  }
+
+  private preserveImage(frame: { output: string }, before: string[], after: string[], x: number, y: number, width: number, height: number): boolean {
+    let preserved = true;
+    for (let row = y; row < y + height; row++) {
+      const line = after[row] ?? "";
+      if (line === before[row]) continue;
+      // Pi 1.5.2 rewrites entire rows. Leave the image cells untouched when only text/markers change.
+      // Native image rows use a different renderer path: keep those packets intact and repaint our PNG.
+      const original = `\x1b[${row + 1};1H\x1b[2K${line}`;
+      if (isImageLine(line) || isImageLine(before[row] ?? "") || !frame.output.includes(original)) { preserved = false; continue; }
+      const left = sliceByColumn(line, 0, x, true);
+      const rightWidth = this.tui.terminal.columns - x - width;
+      const right = sliceByColumn(line, x + width, rightWidth, true);
+      const reset = "\x1b[0m\x1b]8;;\x07";
+      const replacement = `\x1b[${row + 1};1H${left}${" ".repeat(Math.max(0, x - visibleWidth(left)))}${reset}\x1b[${row + 1};${x + width + 1}H${right}${" ".repeat(Math.max(0, rightWidth - visibleWidth(right)))}${reset}`;
+      frame.output = frame.output.replace(original, () => replacement);
+    }
+    return preserved;
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    const host = renderer(this.tui);
+    if (host.doRender === this.wrapped) {
+      if (this.hadOwn) host.doRender = this.original;
+      else delete (host as Partial<Renderer>).doRender;
+    }
+    if (this.painted && minimapProtocol(this.tui) === "kitty") this.tui.terminal.write(`${BEGIN}${deleteKittyImage(this.imageId)}${END}`);
+    this.painted = false;
+    this.tui.requestRender(true);
+  }
+}

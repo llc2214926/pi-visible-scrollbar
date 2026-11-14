@@ -1,0 +1,7 @@
+node_modules/
+*.tgz
+# Local verification is deliberately excluded from Git and the published package.
+tests/
+.test-artifacts/
+.DS_Store
+/.pi
