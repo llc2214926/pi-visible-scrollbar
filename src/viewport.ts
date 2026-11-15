@@ -106,8 +106,8 @@ export class Viewport {
       const previous = !following && before === this.previousTop && this.history.anchors !== this.previousAnchors
         ? nearestAnchor(this.previousAnchors, before) : undefined;
       this.originalUpdate.call(scroll, total, height, requestRender);
-      if (!this.history.isPending && this.pendingId && !this.history.prompts.some(p => p.id === this.pendingId)) this.pendingId = undefined;
-      const target = !this.history.isPending && this.pendingId ? this.history.anchors.find(a => a.id === this.pendingId) : undefined;
+      if (!this.history.isPending && this.pendingId && !this.history.hasPrompt(this.pendingId)) this.pendingId = undefined;
+      const target = !this.history.isPending && this.pendingId ? this.history.anchor(this.pendingId) : undefined;
       if (target) {
         this.originalScrollTo(target.row, { disableFollow: true });
         this.pendingId = undefined;
@@ -115,12 +115,12 @@ export class Viewport {
       } else if (this.preparationBookmark) {
         if (this.history.isPending) this.originalScrollTo(before, { disableFollow: true });
         else {
-          const anchor = this.history.anchors.find(a => a.id === this.preparationBookmark!.id);
+          const anchor = this.history.anchor(this.preparationBookmark.id);
           if (anchor) this.originalScrollTo(anchor.row + this.preparationBookmark.offset, { disableFollow: true });
           this.preparationBookmark = undefined;
         }
       } else if (!following && before === this.previousTop && previous) {
-        const moved = this.history.anchors.find(a => a.id === previous.id);
+        const moved = this.history.anchor(previous.id);
         if (moved) this.originalScrollTo(moved.row + before - previous.row, { disableFollow: true });
       }
       this.previousTop = scroll.scrollTop;
@@ -167,14 +167,15 @@ export class Viewport {
     // Remember later settings changes, but keep only our custom scrollbar visible while mounted.
     if (!this.disposed && scroll.scrollbar !== "hidden") { this.scrollbar = scroll.scrollbar; scroll.setScrollbar("hidden"); }
     return { anchors: this.history.anchors, lines: this.history.lines, width: this.history.width,
-      height: scroll.viewportHeight, top: scroll.scrollTop, contentHeight: this.history.lines.length, preparing: this.history.isPending };
+      height: scroll.viewportHeight, top: scroll.scrollTop, contentHeight: this.history.lines.length, preparing: this.history.isPending,
+      lineChange: this.history.lineChange };
   }
 
   jump(id: string): boolean {
-    if (!this.mounted || !this.history.prompts.some(p => p.id === id)) return false;
+    if (!this.mounted || !this.history.hasPrompt(id)) return false;
     this.preparationBookmark = undefined;
     this.pendingId = id;
-    const anchor = this.history.anchors.find(a => a.id === id);
+    const anchor = this.history.anchor(id);
     if (anchor) {
       this.originalScrollTo(anchor.row, { disableFollow: true });
       if (!this.history.isPending) this.pendingId = undefined;

@@ -1,8 +1,9 @@
 import * as host from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text, stripTerminalSequences, type Component, type TUI } from "@earendil-works/pi-tui";
 import { randomUUID } from "node:crypto";
-import { label, type Anchor, type Prompt } from "./model.ts";
+import { anchorIndex, label, nearestAnchor, type Anchor, type LineChange, type Prompt } from "./model.ts";
 import { ArchivedHistory } from "./archive.ts";
+import { SessionBranch } from "./branch.ts";
 
 type Entry = host.SessionEntry;
 interface NativeFields {
@@ -17,6 +18,16 @@ function nativeFields(component: Component): NativeFields {
   return component as unknown as NativeFields;
 }
 interface Boundary { component: Component; slot: number; signature: string; prompt: boolean }
+interface ArchiveState {
+  key: string;
+  count: number;
+  built: number;
+  lastId: string;
+  component: ArchivedHistory;
+  users: Map<Component, Prompt>;
+  tools: Map<string, host.ToolExecutionComponent>;
+  footer: Component;
+}
 
 export function userText(entry: Entry): string | undefined {
   if (entry.type !== "message" || entry.message.role !== "user") return undefined;
@@ -120,30 +131,37 @@ function boundaries(children: readonly Component[]): Boundary[] {
 export class History {
   anchors: Anchor[] = [];
   lines: readonly string[] = [];
+  lineChange?: LineChange;
   width = 0;
   prompts: Prompt[] = [];
-  private branch: Entry[] = [];
+  private ancestry = new SessionBranch();
+  private get branch(): Entry[] { return this.ancestry.entries; }
   private signatures: (string | undefined)[] = [];
+  private signaturePositions = new Map<string, number[]>();
   private promptById = new Map<string, Prompt>();
+  private promptRanks = new Map<string, number>();
   private supplements = new Map<string, Component>();
   private leaf: string | null | undefined;
   private rawChildren: Component[] = [];
-  private archiveCache?: { key: string; count: number; lastId: string; component: ArchivedHistory; users: Map<Component, Prompt>; tools: Map<string, host.ToolExecutionComponent>; footer: Component };
+  private archiveCache?: ArchiveState;
   private preparationError?: Error;
   private owned = new Set<Component>();
   private bound = new Map<Component, { original: Component["render"]; wrapped: Component["render"]; own: boolean; token: number; id: string }>();
   private bindingPass = new Set<Component>();
+  private nativeBound = new Set<Component>();
   private tokenSerial = 0;
   private tokens = new Map<number, Prompt>();
   private collecting = false;
   private dirty = true;
   private disposed = false;
   private marker = `\x1b]777;pi-visible-scrollbar-${randomUUID()};`;
+  private archiveMarker = `${this.marker}a\x07`;
   private markerPattern = new RegExp(`${this.marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(s|e);(\\d+)\\x07`, "g");
   private originalRender: Component["render"];
   private wrappedRender: Component["render"];
   private hadOwnRender: boolean;
-  private renderCache?: { width: number; marked: string[]; clean: string[] };
+  private renderCache?: { width: number; marked: string[]; clean: string[]; archive?: { row: number; source: readonly string[] } };
+  private anchorById = new Map<string, Anchor>();
 
   constructor(private document: Component, private chat: Container, private ctx: host.ExtensionContext, private tui: TUI, private onError?: (error: unknown) => void) {
     this.originalRender = document.render;
@@ -165,24 +183,49 @@ export class History {
     document.render = this.wrappedRender;
   }
 
+  private archiveSpan(rendered: readonly string[]): { row: number; source: readonly string[] } | undefined {
+    const archive = this.archiveCache?.component, source = archive?.collectedLines;
+    // Only native concatenation guarantees that our immutable block is copied verbatim.
+    // A foreign renderer keeps the fully checked path, even if it preserves the boundary marker.
+    if (!source?.length || this.originalRender !== Container.prototype.render || this.chat.render !== Container.prototype.render ||
+        archive?.render !== ArchivedHistory.prototype.render) return undefined;
+    const row = rendered.indexOf(source[0]);
+    if (row >= 0 && rendered[row + source.length - 1] === source[source.length - 1]) return { row, source };
+    return undefined;
+  }
+
   private collectLines(rendered: string[], width: number): string[] {
-    const cached = this.renderCache;
+    const cached = this.renderCache, archive = this.archiveSpan(rendered);
+    const sameArchive = archive && cached?.archive?.source === archive.source;
     let from = 0, oldEnd = cached?.marked.length ?? 0, end = rendered.length;
-    if (cached?.width === width) {
-      while (from < Math.min(oldEnd, end) && rendered[from] === cached.marked[from]) from++;
-      if (from === oldEnd && from === end) return cached.clean;
-      while (oldEnd > from && end > from && rendered[end - 1] === cached.marked[oldEnd - 1]) { oldEnd--; end--; }
+    if (cached) {
+      while (from < Math.min(oldEnd, end)) {
+        if (sameArchive && from === archive.row && from === cached.archive!.row) from += archive.source.length;
+        else if (rendered[from] === cached.marked[from]) from++;
+        else break;
+      }
+      if (from === oldEnd && from === end) {
+        cached.archive = archive; cached.width = width; this.width = width;
+        return cached.clean;
+      }
+      while (oldEnd > from && end > from) {
+        if (sameArchive && archive.row >= from && end === archive.row + archive.source.length &&
+            oldEnd === cached.archive!.row + archive.source.length) {
+          end -= archive.source.length; oldEnd -= archive.source.length;
+        } else if (rendered[end - 1] === cached.marked[oldEnd - 1]) { oldEnd--; end--; }
+        else break;
+      }
       // A changed middle line must include both markers of the user card that encloses it.
-      const first = this.anchors.find(anchor => anchor.end > from);
-      if (first && first.row < from) from = first.row;
-      const last = this.anchors.find(anchor => anchor.row < oldEnd && anchor.end > oldEnd);
-      if (last) { end += last.end - oldEnd; oldEnd = last.end; }
+      const first = nearestAnchor(this.anchors, from);
+      if (first && first.row < from && first.end > from) from = first.row;
+      const last = nearestAnchor(this.anchors, oldEnd);
+      if (last && last.row < oldEnd && last.end > oldEnd) { end += last.end - oldEnd; oldEnd = last.end; }
     }
     const found = new Map<number, Anchor>();
     const middle = rendered.slice(from, end).map((line, index) => {
       if (!line.includes(this.marker)) return line;
       const row = from + index;
-      return line.replace(this.markerPattern, (_match, side: string, key: string) => {
+      return line.replace(this.archiveMarker, "").replace(this.markerPattern, (_match, side: string, key: string) => {
         const token = Number(key), prompt = this.tokens.get(token);
         if (prompt) {
           if (side === "s") found.set(token, { ...prompt, row, end: row + 1 });
@@ -192,26 +235,44 @@ export class History {
       });
     });
     const clean = (cached?.clean.slice(0, from) ?? []).concat(middle, cached?.clean.slice(oldEnd) ?? []);
-    const delta = end - oldEnd;
-    const anchors = (cached ? this.anchors.filter(anchor => anchor.end <= from) : []).concat(
-      [...found.values()],
-      cached ? this.anchors.filter(anchor => anchor.row >= oldEnd).map(anchor => delta ? { ...anchor, row: anchor.row + delta, end: anchor.end + delta } : anchor) : [],
-    );
-    if (anchors.length !== this.anchors.length || anchors.some((anchor, i) => anchor.id !== this.anchors[i].id || anchor.row !== this.anchors[i].row || anchor.end !== this.anchors[i].end)) this.anchors = anchors;
+    this.updateAnchors([...found.values()], from, oldEnd, end - oldEnd, !!cached);
+    // A minimap may skip an unchanged local window, without retaining another full-history array.
+    this.lineChange = cached ? { previous: new WeakRef(cached.clean), from, oldEnd, end } : undefined;
     this.lines = clean;
     this.width = width;
-    this.renderCache = { width, marked: rendered.slice(), clean };
+    // Native Container allocates a new array every render. Other renderers may reuse mutable arrays.
+    this.renderCache = { width, marked: this.originalRender === Container.prototype.render ? rendered : rendered.slice(), clean, archive };
     return clean;
   }
+
+  private updateAnchors(found: Anchor[], from: number, oldEnd: number, delta: number, cached: boolean): void {
+    const before = cached ? anchorIndex(this.anchors, from) : 0;
+    const after = cached ? anchorIndex(this.anchors, oldEnd) : this.anchors.length;
+    if (found.length === after - before && (!delta || after === this.anchors.length) && found.every((anchor, i) => {
+      const old = this.anchors[before + i];
+      return anchor.id === old.id && anchor.row === old.row && anchor.end === old.end;
+    })) return;
+    for (let i = before; i < after; i++) this.anchorById.delete(this.anchors[i].id);
+    const tail = this.anchors.slice(after).map(anchor => delta ? { ...anchor, row: anchor.row + delta, end: anchor.end + delta } : anchor);
+    for (const anchor of found) this.anchorById.set(anchor.id, anchor);
+    if (delta) for (const anchor of tail) this.anchorById.set(anchor.id, anchor);
+    this.anchors = this.anchors.slice(0, before).concat(found, tail);
+  }
+
+  anchor(id: string): Anchor | undefined { return this.anchorById.get(id); }
 
   get isPending(): boolean { return this.archiveCache?.component.isPending ?? false; }
   invalidate(): void { this.dirty = true; }
 
-  private bind(component: Component, prompt: Prompt): void {
-    this.bindingPass.add(component);
+  hasPrompt(id: string): boolean { return this.promptById.has(id); }
+  promptRank(id: string): number { return this.promptRanks.get(id) ?? -1; }
+
+  private bind(component: Component, prompt: Prompt, archived = false): void {
+    if (!archived) { this.bindingPass.add(component); this.nativeBound.add(component); }
     const previous = this.bound.get(component);
     if (previous?.id === prompt.id && component.render === previous.wrapped) return;
-    if (previous) this.unbind(new Set([...this.bound.keys()].filter(c => c !== component)));
+    if (previous) this.unbind([component]);
+    if (!archived) this.nativeBound.add(component);
     const original = component.render;
     const token = this.tokenSerial++;
     this.tokens.set(token, prompt);
@@ -230,20 +291,22 @@ export class History {
     component.render = wrapped;
   }
 
-  private unbind(keep?: ReadonlySet<Component>): void {
-    for (const [component, binding] of this.bound) {
-      if (keep?.has(component)) continue;
+  private unbind(components: Iterable<Component> = this.bound.keys()): void {
+    for (const component of components) {
+      const binding = this.bound.get(component);
+      if (!binding) continue;
       if (component.render === binding.wrapped) {
         if (binding.own) component.render = binding.original;
         else delete (component as Partial<Component>).render;
       }
       this.bound.delete(component);
+      this.nativeBound.delete(component);
       this.tokens.delete(binding.token);
       this.renderCache = undefined;
     }
   }
 
-  private makeUser(entry: Entry, prompt: Prompt): Component {
+  private makeUser(entry: Entry, prompt: Prompt, archived = false): Component {
     const group = new Container();
     const text = userText(entry) ?? prompt.text;
     const skill = host.parseSkillBlock(text);
@@ -251,73 +314,132 @@ export class History {
       group.addChild(new host.SkillInvocationMessageComponent(skill));
       if (skill.userMessage) group.addChild(new host.UserMessageComponent(skill.userMessage));
     } else group.addChild(new host.UserMessageComponent(prompt.text));
-    this.bind(group, prompt);
+    this.bind(group, prompt, archived);
     return group;
   }
 
-  private archive(entries: Entry[], prompts: Map<string, Prompt>): Container {
+  private archive(entries: Entry[], count: number, prompts: Map<string, Prompt>): Container {
     // Session entries are immutable, and the final ID identifies its entire parent chain.
-    const key = `${entries.length}:${entries.at(-1)?.id ?? ""}`;
-    if (this.archiveCache?.key === key) {
-      for (const [component, prompt] of this.archiveCache.users) this.bind(component, prompt);
-      return this.archiveCache.component;
-    }
-    if (!entries.some(e => userText(e) !== undefined)) {
-      this.archiveCache?.component.dispose();
-      this.archiveCache = undefined;
+    const lastId = entries[count - 1]?.id ?? "", key = `${count}:${lastId}`;
+    if (this.archiveCache?.key === key) return this.archiveCache.component;
+    if (!this.prompts.length || this.prompts[0].entryIndex >= count) {
+      this.releaseArchive();
       return new Container();
     }
     const previous = this.archiveCache;
-    const extending = previous && entries.length > previous.count && entries[previous.count - 1]?.id === previous.lastId;
-    const archive = extending ? previous.component : new ArchivedHistory(
-      () => this.collecting,
-      render => { const wasCollecting = this.collecting; this.collecting = true; try { return render(); } finally { this.collecting = wasCollecting; } },
-      () => { if (!this.disposed) this.tui.requestRender(); },
-      error => { if (!this.disposed) { this.preparationError = error instanceof Error ? error : new Error(String(error)); this.tui.requestRender(); } },
-    );
-    const users = extending ? previous.users : new Map<Component, Prompt>();
-    const tools = extending ? previous.tools : new Map<string, host.ToolExecutionComponent>();
-    if (extending) {
-      archive.removeChild(previous.footer);
-      for (const [component, prompt] of users) this.bind(component, prompt);
+    let state: ArchiveState;
+    if (previous && count > previous.count && entries[previous.count - 1]?.id === previous.lastId) {
+      state = previous;
+      state.component.removeChild(state.footer);
+      state.count = count; state.key = key; state.lastId = lastId;
     } else {
-      previous?.component.dispose();
-      archive.addChild(new Text(" Earlier history · read-only · model context unchanged", 0, 1));
+      this.releaseArchive();
+      const component = new ArchivedHistory(
+        () => this.collecting,
+        render => { const wasCollecting = this.collecting; this.collecting = true; try { return render(); } finally { this.collecting = wasCollecting; } },
+        () => { if (!this.disposed) this.tui.requestRender(); },
+        error => { if (!this.disposed) { this.preparationError = error instanceof Error ? error : new Error(String(error)); this.tui.requestRender(); } },
+        this.archiveMarker,
+      );
+      component.addChild(new Text(" Earlier history · read-only · model context unchanged", 0, 1));
+      state = { key, count, built: 0, lastId, component, users: new Map(), tools: new Map(), footer: new Text(" End of earlier history", 0, 1) };
     }
-    for (const entry of entries.slice(extending ? previous.count : 0)) {
-      const prompt = prompts.get(entry.id);
-      if (prompt) {
-        const component = this.makeUser(entry, prompt);
-        users.set(component, prompt);
-        archive.addChild(component);
-        continue;
-      }
-      for (const message of host.sessionEntryToContextMessages(entry)) {
-        if (message.role === "assistant") {
-          archive.addChild(new host.AssistantMessageComponent(message, true));
-          for (const content of message.content) {
-            if (content.type !== "toolCall") continue;
-            // An empty renderer selects Pi's expandable fallbacks, not its legacy full-output path.
-            const tool = new host.ToolExecutionComponent(content.name, content.id, content.arguments, { showImages: false }, {}, this.tui, this.ctx.cwd);
-            tool.setExpanded(this.ctx.ui.getToolsExpanded());
-            tools.set(content.id, tool);
-            archive.addChild(tool);
-          }
-        } else if (message.role === "toolResult") {
-          const tool = tools.get(message.toolCallId);
-          if (tool) tool.updateResult(message);
-          else archive.addChild(new Text(stripTerminalSequences(message.content.filter(c => c.type === "text").map(c => c.text).join("\n")), 1, 1));
-        } else if (message.role === "custom" && message.display) {
-          archive.addChild(new host.CustomMessageComponent(message));
-        } else if (message.role === "bashExecution") {
-          archive.addChild(new Text(stripTerminalSequences(`$ ${message.command}\n${message.output}`), 1, 1));
+    this.archiveCache = state;
+    const next = () => {
+      if (state.built === state.count) { state.component.addChild(state.footer); return false; }
+      const entry = entries[state.built];
+      this.appendArchived(entry, prompts.get(entry.id), state);
+      state.built++;
+      return true;
+    };
+    if (!state.component.isBuilding) {
+      if (state.count - state.built > 512) state.component.populate(next);
+      else while (next()) { /* Small updates stay synchronous. */ }
+    }
+    return state.component;
+  }
+
+  private appendArchived(entry: Entry, prompt: Prompt | undefined, { component: archive, users, tools }: ArchiveState): void {
+    if (prompt) {
+      const component = this.makeUser(entry, prompt, true);
+      users.set(component, prompt);
+      archive.addChild(component);
+      return;
+    }
+    for (const message of host.sessionEntryToContextMessages(entry)) {
+      if (message.role === "assistant") {
+        archive.addChild(new host.AssistantMessageComponent(message, true));
+        for (const content of message.content) {
+          if (content.type !== "toolCall") continue;
+          // An empty renderer selects Pi's expandable fallbacks, not its legacy full-output path.
+          const tool = new host.ToolExecutionComponent(content.name, content.id, content.arguments, { showImages: false }, {}, this.tui, this.ctx.cwd);
+          tool.setExpanded(this.ctx.ui.getToolsExpanded());
+          tools.set(content.id, tool);
+          archive.addChild(tool);
         }
+      } else if (message.role === "toolResult") {
+        const tool = tools.get(message.toolCallId);
+        if (tool) tool.updateResult(message);
+        else archive.addChild(new Text(stripTerminalSequences(message.content.filter(c => c.type === "text").map(c => c.text).join("\n")), 1, 1));
+      } else if (message.role === "custom" && message.display) {
+        archive.addChild(new host.CustomMessageComponent(message));
+      } else if (message.role === "bashExecution") {
+        archive.addChild(new Text(stripTerminalSequences(`$ ${message.command}\n${message.output}`), 1, 1));
       }
     }
-    const footer = new Text(" End of earlier history", 0, 1);
-    archive.addChild(footer);
-    this.archiveCache = { key, count: entries.length, lastId: entries.at(-1)!.id, component: archive, users, tools, footer };
-    return archive;
+  }
+
+  private releaseArchive(): void {
+    if (!this.archiveCache) return;
+    this.archiveCache.component.dispose();
+    this.unbind(this.archiveCache.users.keys());
+    this.archiveCache = undefined;
+  }
+
+  private match(signature: string, cursor: number): number {
+    const positions = this.signaturePositions.get(signature);
+    if (!positions) return -1;
+    let low = 0, high = positions.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (positions[middle] <= cursor) low = middle + 1;
+      else high = middle;
+    }
+    return positions[low - 1] ?? -1;
+  }
+
+  private indexBranch(from: number): void {
+    const branch = this.branch;
+    for (let i = this.signatures.length - 1; i >= from; i--) {
+      const key = this.signatures[i];
+      if (key === undefined) continue;
+      const positions = this.signaturePositions.get(key)!;
+      positions.pop();
+      if (!positions.length) this.signaturePositions.delete(key);
+    }
+    this.signatures.length = from;
+    let retained = this.prompts.length;
+    while (retained && this.prompts[retained - 1].entryIndex >= from) {
+      const id = this.prompts[--retained].id;
+      this.promptById.delete(id);
+      this.promptRanks.delete(id);
+    }
+    const added: Prompt[] = [];
+    for (let i = from; i < branch.length; i++) {
+      const prompt = promptFor(branch[i], i);
+      if (prompt) {
+        this.promptRanks.set(prompt.id, retained + added.length);
+        added.push(prompt); this.promptById.set(prompt.id, prompt);
+      }
+      const key = entrySignature(branch[i]);
+      this.signatures.push(key);
+      if (key !== undefined) {
+        const positions = this.signaturePositions.get(key);
+        if (positions) positions.push(i);
+        else this.signaturePositions.set(key, [i]);
+      }
+    }
+    if (retained !== this.prompts.length || added.length) this.prompts = this.prompts.slice(0, retained).concat(added);
   }
 
   private sync(): void {
@@ -327,42 +449,31 @@ export class History {
     const raw = this.chat.children.filter(c => !this.owned.has(c));
     const changed = raw.length !== this.rawChildren.length || raw.some((c, i) => c !== this.rawChildren[i]);
     if (!this.dirty && leaf === this.leaf && !changed) return;
-    const branch = this.ctx.sessionManager.getBranch();
-    const appendOnly = this.branch.length <= branch.length && this.branch.every((entry, i) => entry.id === branch[i].id);
+    const oldLength = this.signatures.length;
+    const from = this.ancestry.sync(this.ctx.sessionManager);
     this.dirty = false;
     this.leaf = leaf;
-    if (appendOnly && branch.length === this.branch.length && !changed) return;
-    const from = appendOnly ? this.branch.length : 0;
-    if (!appendOnly) { this.promptById.clear(); this.signatures = []; }
-    const added: Prompt[] = [];
-    for (let i = from; i < branch.length; i++) {
-      const prompt = promptFor(branch[i], i);
-      if (prompt) { added.push(prompt); this.promptById.set(prompt.id, prompt); }
-      this.signatures.push(entrySignature(branch[i]));
-    }
-    if (!appendOnly || added.length) this.prompts = [...(appendOnly ? this.prompts : []), ...added];
-    this.branch = branch;
+    if (from === oldLength && this.branch.length === oldLength && !changed) return;
+    this.indexBranch(from);
     this.rawChildren = raw;
     const prompts = this.promptById;
     this.bindingPass.clear();
     this.chat.children = raw.slice();
     this.owned.clear();
     const native = boundaries(raw);
-    const signatures = this.signatures;
     const matches: { boundary: Boundary; index: number }[] = [];
     let cursor = this.branch.length - 1;
     // Backward matching distinguishes repeated identical prompts in a retained suffix.
     for (let i = native.length - 1; i >= 0; i--) {
       const boundary = native[i];
-      let index = cursor;
-      while (index >= 0 && signatures[index] !== boundary.signature) index--;
+      const index = this.match(boundary.signature, cursor);
       if (index < 0) continue; // A streaming card can precede persistence of its entry.
       matches.push({ boundary, index });
       cursor = index - 1;
       const prompt = prompts.get(this.branch[index].id);
       if (boundary.prompt && prompt) this.bind(boundary.component, prompt);
     }
-    matches.sort((a, b) => a.index - b.index);
+    matches.reverse();
     const prefixEnd = matches[0]?.index ?? this.branch.length;
     const additions = new Map<number, Component[]>();
     const add = (slot: number, component: Component) => {
@@ -371,14 +482,21 @@ export class History {
       if (list) list.push(component);
       else additions.set(slot, [component]);
     };
-    const archive = this.archive(this.branch.slice(0, prefixEnd), prompts);
+    const archive = this.archive(this.branch, prefixEnd, prompts);
     if (archive.children.length) add(0, archive);
     const present = new Set(matches.filter(m => m.boundary.prompt).map(m => this.branch[m.index].id));
     const matched = new Set(matches.map(m => m.boundary));
     const streaming = native.filter(n => !matched.has(n) && n.signature.startsWith("assistant:"));
+    let firstPrompt = 0, lastPrompt = this.prompts.length;
+    while (firstPrompt < lastPrompt) {
+      const middle = (firstPrompt + lastPrompt) >>> 1;
+      if (this.prompts[middle].entryIndex < prefixEnd) firstPrompt = middle + 1;
+      else lastPrompt = middle;
+    }
     let nextIndex = 0;
-    for (const prompt of this.prompts) {
-      if (prompt.entryIndex < prefixEnd || present.has(prompt.id)) continue;
+    for (let i = firstPrompt; i < this.prompts.length; i++) {
+      const prompt = this.prompts[i];
+      if (present.has(prompt.id)) continue;
       // Pi does not render image-only inputs. Walk the sorted matches once, not once per input.
       while (nextIndex < matches.length && matches[nextIndex].index <= prompt.entryIndex) nextIndex++;
       const next = matches[nextIndex];
@@ -391,9 +509,16 @@ export class History {
       add(next?.boundary.slot ?? pending?.slot ?? raw.length, component);
     }
     for (const [id, component] of this.supplements) if (!this.owned.has(component)) this.supplements.delete(id);
-    this.unbind(this.bindingPass);
-    this.chat.children = raw.flatMap((component, i) => [...(additions.get(i) ?? []), component]);
-    this.chat.children.push(...(additions.get(raw.length) ?? []));
+    for (const component of this.nativeBound) if (!this.bindingPass.has(component)) this.unbind([component]);
+    if (!additions.size) this.chat.children = raw;
+    else {
+      const children: Component[] = [];
+      for (let i = 0; i <= raw.length; i++) {
+        for (const component of additions.get(i) ?? []) children.push(component);
+        if (i < raw.length) children.push(raw[i]);
+      }
+      this.chat.children = children;
+    }
   }
 
   dispose(): void {
@@ -408,12 +533,16 @@ export class History {
       else delete (this.document as Partial<Component>).render;
     }
     this.lines = [];
+    this.lineChange = undefined;
     this.anchors = [];
+    this.anchorById.clear();
     this.prompts = [];
-    this.branch = [];
+    this.ancestry.clear();
     this.signatures = [];
+    this.signaturePositions.clear();
     this.rawChildren = [];
     this.promptById.clear();
+    this.promptRanks.clear();
     this.supplements.clear();
     this.bindingPass.clear();
     this.archiveCache = undefined;

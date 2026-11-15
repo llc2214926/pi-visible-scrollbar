@@ -5,3 +5,5 @@ tests/
 .test-artifacts/
 .DS_Store
 /.pi
+docs/extreme-performance-design.md
+docs/extension-performance.md

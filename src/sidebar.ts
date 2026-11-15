@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getCellDimensions, matchesKey, truncateToWidth, visibleWidth, type Component, type OverlayHandle, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { buckets, dragTop, thumb, type Anchor, type Snapshot } from "./model.ts";
+import { bucketRanges, dragTop, thumb, type Anchor, type AnchorRange, type Snapshot } from "./model.ts";
 import { Minimap, minimapGeometry } from "./minimap.ts";
 import { GraphicMinimap, minimapProtocol } from "./graphics.ts";
 import { Viewport } from "./viewport.ts";
@@ -10,7 +10,7 @@ const DRAG_SCROLL_MS = 32;
 export class Sidebar implements Component {
   private map: Minimap;
   private rendered?: Snapshot;
-  private tracks: Anchor[][] = [];
+  private tracks: AnchorRange[] = [];
   private minimapLayout = false;
   private terminalSize = "";
   private drag?: { kind: "thumb"; grab: number } | { kind: "map"; grab: number; position: number; moved: boolean };
@@ -21,7 +21,7 @@ export class Sidebar implements Component {
   private warned = "";
   private disposed = false;
   private popup?: OverlayHandle;
-  private popupKey = "";
+  private popupRange?: { anchors: readonly Anchor[]; start: number; end: number };
   private removeInput: () => void;
 
   constructor(private viewport: Viewport, private ctx: ExtensionContext, private experimentalMinimap: boolean) {
@@ -121,7 +121,7 @@ export class Sidebar implements Component {
   render(width: number): string[] {
     const snapshot = this.viewport.snapshot();
     if (snapshot.anchors !== this.rendered?.anchors || snapshot.contentHeight !== this.rendered.contentHeight || snapshot.height !== this.rendered.height) {
-      this.tracks = buckets(snapshot.anchors, snapshot.contentHeight, snapshot.height);
+      this.tracks = bucketRanges(snapshot.anchors, snapshot.contentHeight, snapshot.height);
     }
     this.rendered = snapshot;
     const miniWidth = Math.max(0, width - 3);
@@ -131,10 +131,10 @@ export class Sidebar implements Component {
     const geometry = thumb(snapshot.top, snapshot.contentHeight, snapshot.height);
     const theme = this.ctx.ui.theme;
     return Array.from({ length: snapshot.height }, (_, row) => {
-      const entries = this.tracks[row];
+      const entries = this.tracks[row].end - this.tracks[row].start;
       let mark = "  ";
-      if (entries.length > 1) mark = "≡ ";
-      else if (entries.length) mark = "━ ";
+      if (entries > 1) mark = "≡ ";
+      else if (entries) mark = "━ ";
       const inView = row >= geometry.top && row < geometry.top + geometry.size;
       const inMapView = mapGeometry && mapTop !== undefined && row + 0.5 >= mapTop && row + 0.5 < mapTop + mapGeometry.size;
       const mapRow = " ".repeat(miniWidth);
@@ -152,7 +152,8 @@ export class Sidebar implements Component {
       if (this.drag?.kind === "map") { this.cancelDrag(); this.suppressClick = false; }
       this.closePopup(); this.viewport.scrollBy(event.wheelDelta ?? 0); return { handled: true };
     }
-    const group = this.tracks[event.y] ?? [];
+    const group = this.tracks[event.y] ?? { start: 0, end: 0 };
+    const count = group.end - group.start;
     const marker = event.x >= event.width - 3 && event.x < event.width - 1;
     const onThumbLane = event.x === event.width - 1;
     const miniWidth = Math.max(0, event.width - 3);
@@ -164,7 +165,7 @@ export class Sidebar implements Component {
       const wasDragging = !!this.drag;
       this.cancelDrag();
       this.suppressClick = false;
-      if (marker && group.length > 1) this.openPopup(group, event);
+      if (marker && count > 1) this.openPopup(group, snapshot.anchors, event);
       // Keep the popup reachable while crossing the experimental minimap to its left.
       else if (marker || onThumbLane) this.closePopup();
       return { handled: true, render: wasDragging };
@@ -206,23 +207,23 @@ export class Sidebar implements Component {
     if (event.type === "click" && event.button === "left") {
       if (this.suppressClick) { this.suppressClick = false; return { handled: true }; }
       if (onMap && mapGeometry) this.viewport.scrollTo(Math.round(mapGeometry.start + (event.y + 0.5) * mapGeometry.count / Math.max(1, snapshot.height) - snapshot.height / 2));
-      else if (marker && group.length === 1) this.viewport.jump(group[0].id);
-      else if (marker && group.length > 1) this.openPopup(group, event);
+      else if (marker && count === 1) this.viewport.jump(snapshot.anchors[group.start].id);
+      else if (marker && count > 1) this.openPopup(group, snapshot.anchors, event);
       else if (!onThumbLane) this.viewport.scrollTo(Math.floor(event.y * snapshot.contentHeight / Math.max(1, snapshot.height)));
       return { handled: true };
     }
     return { handled: true, render: false };
   }
 
-  private openPopup(group: Anchor[], event: TuiMouseEvent): void {
-    const key = group.map(a => a.id).join(":");
-    if (this.popup && key === this.popupKey) return;
+  private openPopup(group: AnchorRange, anchors: readonly Anchor[], event: TuiMouseEvent): void {
+    if (this.popup && this.popupRange?.anchors === anchors && this.popupRange.start === group.start && this.popupRange.end === group.end) return;
     this.closePopup();
     const terminal = this.viewport.tui.terminal;
     if (terminal.rows < 4 || terminal.columns < 12) return;
-    this.popupKey = key;
+    this.popupRange = { anchors, ...group };
+    const count = group.end - group.start;
     const width = Math.min(64, terminal.columns);
-    const height = Math.min(12, terminal.rows, group.length + 2);
+    const height = Math.min(12, terminal.rows, count + 2);
     const page = height - 2;
     const left = Math.max(0, event.screenX - event.x - width);
     const top = Math.max(0, Math.min(terminal.rows - height, event.screenY - 1));
@@ -235,19 +236,20 @@ export class Sidebar implements Component {
           return line + " ".repeat(Math.max(0, available - visibleWidth(line)));
         };
         return [
-          theme.bg("selectedBg", theme.fg("accent", fit(` × Close · ${group.length} inputs · click to jump`))),
-          ...group.slice(offset, offset + page).map(anchor => theme.bg("selectedBg", theme.fg("text", fit(` ${this.viewport.history.prompts.findIndex(p => p.id === anchor.id) + 1}. ${anchor.label}`)))),
-          theme.bg("selectedBg", theme.fg("muted", fit(` ${offset + 1}–${Math.min(group.length, offset + page)}/${group.length} · wheel scroll · Esc close`))),
+          theme.bg("selectedBg", theme.fg("accent", fit(` × Close · ${count} inputs · click to jump`))),
+          ...anchors.slice(group.start + offset, Math.min(group.end, group.start + offset + page)).map(anchor => theme.bg("selectedBg", theme.fg("text", fit(` ${this.viewport.history.promptRank(anchor.id) + 1}. ${anchor.label}`)))),
+          theme.bg("selectedBg", theme.fg("muted", fit(` ${offset + 1}–${Math.min(count, offset + page)}/${count} · wheel scroll · Esc close`))),
         ];
       },
       invalidate() {},
       handleMouse: mouse => {
         if (mouse.type === "wheel") {
-          offset = Math.max(0, Math.min(Math.max(0, group.length - page), offset + (mouse.wheelDelta ?? 0)));
+          offset = Math.max(0, Math.min(Math.max(0, count - page), offset + (mouse.wheelDelta ?? 0)));
           return { handled: true };
         }
         if (mouse.type === "click" && mouse.button === "left") {
-          const anchor = mouse.y > 0 && mouse.y <= page ? group[offset + mouse.y - 1] : undefined;
+          const index = group.start + offset + mouse.y - 1;
+          const anchor = mouse.y > 0 && mouse.y <= page && index < group.end ? anchors[index] : undefined;
           if (anchor) this.viewport.jump(anchor.id);
           this.closePopup();
         }
@@ -262,7 +264,7 @@ export class Sidebar implements Component {
     if (!this.popup) return;
     this.popup.hide();
     this.popup = undefined;
-    this.popupKey = "";
+    this.popupRange = undefined;
     this.viewport.tui.requestRender();
   }
 

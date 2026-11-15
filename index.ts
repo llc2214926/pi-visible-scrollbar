@@ -3,6 +3,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { DEFAULT_CONFIG, configPath, loadConfig, saveConfig, type Config } from "./src/config.ts";
 import { Sidebar } from "./src/sidebar.ts";
 import { Viewport } from "./src/viewport.ts";
+import { anchorIndex } from "./src/model.ts";
 
 const WIDGET = "pi-visible-scrollbar.bootstrap";
 const USAGE = "/scrollbar on | off | status | list | prev | next | end | minimap on | minimap off";
@@ -128,7 +129,8 @@ export default function visibleScrollbar(pi: ExtensionAPI): void {
           if (index >= 0 && !viewport.jump(prompts[index].id)) ctx.ui.notify("That input is no longer in the current branch.", "warning");
         }
       } else {
-        const target = action === "next" ? snapshot.anchors.find(a => a.row > snapshot.top) : snapshot.anchors.slice().reverse().find(a => a.row < snapshot.top);
+        const index = anchorIndex(snapshot.anchors, snapshot.top + (action === "next" ? 1 : 0));
+        const target = snapshot.anchors[action === "next" ? index : index - 1];
         if (target) viewport.jump(target.id);
       }
     },

@@ -3,16 +3,24 @@ import { Container, type Component, type TuiMouseEvent } from "@earendil-works/p
 
 const CHUNK_SIZE = 64;
 const ASYNC_THRESHOLD = 512;
-const PREPARE_BUDGET_MS = 8;
+const PREPARE_BUDGET_MS = 4;
 
 /** Keep two recent widths per immutable block; an expansion only invalidates its own block. */
 class ArchivedChunk extends Container {
   private widths = new Map<number, string[]>();
-  constructor(private collecting: () => boolean, private changed: () => void) { super(); }
-  has(width: number): boolean { return this.widths.has(width); }
+  private epoch: number;
+  constructor(private collecting: () => boolean, private changed: () => void, private currentEpoch: () => number) {
+    super(); this.epoch = currentEpoch();
+  }
+  has(width: number): boolean { return this.epoch === this.currentEpoch() && this.widths.has(width); }
   clearCache(): void { this.widths.clear(); this.changed(); }
-  invalidate(): void { this.clearCache(); super.invalidate(); }
+  invalidate(): void { this.clearCache(); super.invalidate(); this.epoch = this.currentEpoch(); }
   render(width: number): string[] {
+    if (this.epoch !== this.currentEpoch()) {
+      this.epoch = this.currentEpoch();
+      this.widths.clear();
+      super.invalidate();
+    }
     if (!this.collecting()) return super.render(width);
     let lines = this.widths.get(width);
     if (!lines) lines = super.render(width);
@@ -53,23 +61,55 @@ class ArchivedChunk extends Container {
 export class ArchivedHistory extends Container {
   private cached?: { width: number; revision: number; lines: string[] };
   private revision = 0;
+  private epoch = 0;
   private count = 0;
   private preparation?: { width: number; next: number; timer?: ReturnType<typeof setTimeout> };
+  private construction?: { next: () => boolean; timer?: ReturnType<typeof setTimeout> };
   private disposed = false;
   constructor(
     private collecting: () => boolean,
     private collect: (render: () => string[]) => string[],
     private ready: () => void,
     private failed: (error: unknown) => void,
+    private marker = "",
   ) { super(); }
 
-  get isPending(): boolean { return !!this.preparation; }
+  get collectedLines(): readonly string[] | undefined { return this.cached?.lines; }
+  get isBuilding(): boolean { return !!this.construction; }
+  get isPending(): boolean {
+    // Construction finishing only queues layout; readiness means its exact lines were published.
+    return !this.disposed && (!!(this.preparation || this.construction) || this.cached?.revision !== this.revision);
+  }
+
+  /** Construct archived views in short batches too, not just their rendered lines. */
+  populate(next: () => boolean): void {
+    if (this.disposed || this.construction) return;
+    const work = { next, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+    this.construction = work;
+    const step = () => {
+      if (this.disposed || this.construction !== work) return;
+      const deadline = performance.now() + PREPARE_BUDGET_MS;
+      try {
+        do {
+          if (!work.next()) { this.construction = undefined; this.ready(); return; }
+        } while (performance.now() < deadline);
+        work.timer = setTimeout(step, 0);
+      } catch (error) {
+        this.construction = undefined;
+        this.failed(error);
+      }
+    };
+    work.timer = setTimeout(step, 0);
+  }
+
   private changed(): void { this.revision++; this.cancelPreparation(); }
-  clearCache(): void { for (const child of this.children) (child as ArchivedChunk).clearCache(); }
+  // Defer descendant invalidation to each preparation batch, rather than walking history on resize.
+  clearCache(): void { this.epoch++; this.changed(); }
+  invalidate(): void { this.clearCache(); }
   addChild(component: Component): void {
     let chunk = this.children.at(-1) as ArchivedChunk | undefined;
     if (!chunk || chunk.children.length >= CHUNK_SIZE) {
-      chunk = new ArchivedChunk(this.collecting, () => this.changed());
+      chunk = new ArchivedChunk(this.collecting, () => this.changed(), () => this.epoch);
       super.addChild(chunk);
     }
     chunk.addChild(component);
@@ -82,8 +122,17 @@ export class ArchivedHistory extends Container {
     if (!chunk.children.length) super.removeChild(chunk);
   }
   render(width: number): string[] {
-    // The marker-bearing caches are private to the document collection pass.
-    if (!this.collecting()) return super.render(width);
+    // Explicit legacy/full output must include views still awaiting background construction.
+    if (!this.collecting()) {
+      const work = this.construction;
+      if (work) {
+        clearTimeout(work.timer);
+        while (work.next()) { /* Full output is necessarily proportional to its size. */ }
+        this.construction = undefined;
+      }
+      return super.render(width);
+    }
+    if (this.construction) return this.cached?.lines ?? [];
     if (this.cached?.width === width && this.cached.revision === this.revision) return this.cached.lines;
     if (this.count > ASYNC_THRESHOLD && this.children.some(child => !(child as ArchivedChunk).has(width))) {
       this.prepare(width);
@@ -92,12 +141,14 @@ export class ArchivedHistory extends Container {
     }
     this.cancelPreparation();
     const lines = super.render(width);
+    if (lines.length) lines[0] = this.marker + lines[0];
     this.cached = { width, revision: this.revision, lines };
     return lines;
   }
   handleMouse(event: TuiMouseEvent) {
     // A prepared child can already have new hit geometry while the old layout is still displayed.
-    if (this.isPending) return undefined;
+    // Cache dirtiness alone must not swallow a release/click following a press.
+    if (this.preparation || this.construction) return undefined;
     return super.handleMouse(event);
   }
   private prepare(width: number): void {
@@ -128,5 +179,10 @@ export class ArchivedHistory extends Container {
     this.preparation = undefined;
   }
   setExpanded(expanded: boolean): void { for (const child of this.children) (child as ArchivedChunk).setExpanded(expanded); }
-  dispose(): void { this.disposed = true; this.cancelPreparation(); }
+  dispose(): void {
+    this.disposed = true;
+    this.cancelPreparation();
+    clearTimeout(this.construction?.timer);
+    this.construction = undefined;
+  }
 }

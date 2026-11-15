@@ -126,6 +126,12 @@ function sameRequest(a: Request, b?: Request): boolean {
     a.lines.every((line, i) => line === b.lines[i] && a.sourceRows[i] === b.sourceRows[i]);
 }
 
+function unchangedWindow(snapshot: Snapshot, previous: readonly string[] | undefined, start: number, end: number): boolean {
+  const change = snapshot.lineChange;
+  return !!previous && change?.previous.deref() === previous &&
+    (change.from >= end || (change.oldEnd === change.end && change.end <= start));
+}
+
 /** One running raster job and one replaceable latest request, never a queue of old scroll positions. */
 export class Minimap {
   private worker?: Worker;
@@ -199,16 +205,21 @@ export class Minimap {
         : Math.max(0, Math.min(Math.round(snapshot.contentHeight * geometry.lineHeight) - cacheHeight, viewOffset - height));
       const first = Math.floor(offset / geometry.lineHeight);
       const end = Math.min(snapshot.contentHeight, Math.ceil((offset + cacheHeight) / geometry.lineHeight));
-      const sourceRows = Array.from({ length: Math.max(0, end - first) }, (_, i) => first + i);
-      const request: Request = {
-        key, lines: sourceRows.map(row => snapshot.lines[row] ?? ""), sourceRows, width, height: cacheHeight, offset,
-        columns: snapshot.width, geometry: { ...geometry, start: offset / geometry.lineHeight }, dark,
-      };
-      this.sourceLines = snapshot.lines;
-      if (!sameRequest(request, this.requested)) {
-        this.requested = this.pending = request;
-        this.schedule();
+      const previous = this.requested;
+      const reuse = previous?.key === key && previous.offset === offset && previous.height === cacheHeight &&
+        previous.sourceRows[0] === first && previous.sourceRows.length === end - first && unchangedWindow(snapshot, this.sourceLines, first, end);
+      if (!reuse) {
+        const sourceRows = Array.from({ length: Math.max(0, end - first) }, (_, i) => first + i);
+        const request: Request = {
+          key, lines: sourceRows.map(row => snapshot.lines[row] ?? ""), sourceRows, width, height: cacheHeight, offset,
+          columns: snapshot.width, geometry: { ...geometry, start: offset / geometry.lineHeight }, dark,
+        };
+        if (!sameRequest(request, previous)) {
+          this.requested = this.pending = request;
+          this.schedule();
+        }
       }
+      this.sourceLines = snapshot.lines;
     }
     // During a drag the rectangle stays responsive while the independent background catches up.
     if (!this.pixels || !covers(this.completed)) return position ? this.previewFrame(position.top, width, height) : undefined;
