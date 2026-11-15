@@ -280,18 +280,21 @@ export class Minimap {
     this.failed(this.failure);
   }
 
-  clear(): void {
+  clear(keepDisplayed = false): void {
     this.epoch++;
     clearTimeout(this.timer);
     this.timer = undefined;
     this.requested = this.pending = undefined;
-    this.png = undefined;
-    this.pngKey = "";
-    this.background = this.rectangle = undefined;
+    // Invalidating background content is not a mouse release; keep pointer feedback available.
+    if (!keepDisplayed) {
+      this.png = undefined;
+      this.pngKey = "";
+      this.background = this.rectangle = undefined;
+      this.displayed = undefined;
+    }
     this.pixels = undefined;
     this.sourceLines = undefined;
     this.completed = undefined;
-    this.displayed = undefined;
     this.geometry = undefined;
     this.failure = undefined;
   }

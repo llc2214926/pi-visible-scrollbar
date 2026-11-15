@@ -13,7 +13,7 @@ export class Sidebar implements Component {
   private tracks: Anchor[][] = [];
   private minimapLayout = false;
   private terminalSize = "";
-  private drag?: { kind: "thumb"; grab: number } | { kind: "map"; grab: number; position: number; moved: boolean; width: number; height: number };
+  private drag?: { kind: "thumb"; grab: number } | { kind: "map"; grab: number; position: number; moved: boolean };
   private dragTimer?: ReturnType<typeof setTimeout>;
   private suppressClick = false;
   private graphics?: GraphicMinimap;
@@ -116,11 +116,10 @@ export class Sidebar implements Component {
     if (this.drag?.kind === "map") this.cancelDrag();
     this.map.dispose(); this.resize(); this.viewport.tui.requestRender(true);
   }
-  invalidate(): void { if (this.drag?.kind === "map") this.cancelDrag(); this.map.clear(); }
+  invalidate(): void { this.map.clear(this.drag?.kind === "map"); }
 
   render(width: number): string[] {
     const snapshot = this.viewport.snapshot();
-    if (this.drag?.kind === "map" && (snapshot.width !== this.drag.width || snapshot.height !== this.drag.height)) this.cancelDrag();
     if (snapshot.anchors !== this.rendered?.anchors || snapshot.contentHeight !== this.rendered.contentHeight || snapshot.height !== this.rendered.height) {
       this.tracks = buckets(snapshot.anchors, snapshot.contentHeight, snapshot.height);
     }
@@ -173,7 +172,7 @@ export class Sidebar implements Component {
     if (event.type === "press" && event.button === "left") {
       this.closePopup();
       if (onMap && mapGeometry && event.y + 1 > mapGeometry.top && event.y < mapGeometry.top + mapGeometry.size) {
-        this.drag = { kind: "map", grab: event.y - mapGeometry.top, position: mapGeometry.max ? snapshot.top / mapGeometry.max : 0, moved: false, width: snapshot.width, height: snapshot.height };
+        this.drag = { kind: "map", grab: event.y - mapGeometry.top, position: mapGeometry.max ? snapshot.top / mapGeometry.max : 0, moved: false };
         this.suppressClick = true;
         if (!this.graphics?.redraw()) this.viewport.tui.requestRender();
         return { capture: true, render: false };
