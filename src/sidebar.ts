@@ -1,9 +1,11 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getCellDimensions, matchesKey, truncateToWidth, visibleWidth, type Component, type OverlayHandle, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { buckets, dragTop, thumb, type Anchor, type Snapshot } from "./model.ts";
-import { Minimap, minimapGeometry, minimapDragTop } from "./minimap.ts";
+import { Minimap, minimapGeometry } from "./minimap.ts";
 import { GraphicMinimap, minimapProtocol } from "./graphics.ts";
 import { Viewport } from "./viewport.ts";
+
+const DRAG_SCROLL_MS = 32;
 
 export class Sidebar implements Component {
   private map: Minimap;
@@ -11,7 +13,8 @@ export class Sidebar implements Component {
   private tracks: Anchor[][] = [];
   private minimapLayout = false;
   private terminalSize = "";
-  private drag?: { kind: "map" | "thumb"; grab: number };
+  private drag?: { kind: "thumb"; grab: number } | { kind: "map"; grab: number; position: number; moved: boolean; width: number; height: number };
+  private dragTimer?: ReturnType<typeof setTimeout>;
   private suppressClick = false;
   private graphics?: GraphicMinimap;
   minimapFailure = "";
@@ -33,26 +36,28 @@ export class Sidebar implements Component {
   resize(): void {
     const terminal = this.viewport.tui.terminal;
     const size = `${terminal.columns}:${terminal.rows}`;
-    if (size !== this.terminalSize) { this.terminalSize = size; this.drag = undefined; this.suppressClick = false; this.closePopup(); }
+    if (size !== this.terminalSize) { this.terminalSize = size; this.cancelDrag(); this.suppressClick = false; this.closePopup(); }
     const protocol = minimapProtocol(this.viewport.tui);
     const enabled = this.experimentalMinimap && !this.minimapFailure && protocol !== null && terminal.columns >= 60;
     if (this.experimentalMinimap && !protocol) this.warn("Pixel minimap needs iTerm2 or Kitty graphics in a direct terminal. Input markers remain available; no dot-map fallback is used.");
     if (enabled && !this.graphics) {
       try {
-        this.graphics = new GraphicMinimap(this.viewport.tui, this, (width, height, protocol) => {
-          const snapshot = this.viewport.snapshot(), dark = this.ctx.ui.theme.appearance === "dark", dragging = this.drag?.kind === "map";
+        this.graphics = new GraphicMinimap(this.viewport.tui, this, (width, height, protocol, preview) => {
+          const snapshot = this.viewport.snapshot(), dark = this.ctx.ui.theme.appearance === "dark";
+          const drag = this.drag?.kind === "map" ? this.drag : undefined;
+          const position = drag ? { top: drag.position * minimapGeometry(snapshot, width, height).travel / Math.max(1, snapshot.height), preview } : undefined;
           if (protocol === "kitty") {
-            const layers = this.map.renderLayers(snapshot, width, height, dark, dragging);
+            const layers = this.map.renderLayers(snapshot, width, height, dark, !!drag, position);
             return layers ? { protocol, layers } : undefined;
           }
-          const png = this.map.render(snapshot, width, height, dark, dragging);
+          const png = this.map.render(snapshot, width, height, dark, !!drag, position);
           return png ? { protocol, png } : undefined;
         }, error => this.failMinimap(error));
       } catch (error) { this.failMinimap(error); }
     } else if (!enabled && this.graphics) { this.graphics.dispose(); this.graphics = undefined; this.map.dispose(); }
     const proportional = enabled && !this.minimapFailure;
     if (proportional !== this.minimapLayout || !this.viewport.mounted) {
-      this.drag = undefined;
+      this.cancelDrag();
       this.suppressClick = false;
       this.minimapLayout = proportional;
       this.closePopup();
@@ -60,8 +65,30 @@ export class Sidebar implements Component {
     }
   }
 
+  private cancelDrag(): void {
+    clearTimeout(this.dragTimer);
+    this.dragTimer = undefined;
+    this.drag = undefined;
+  }
+
+  private flushMapDrag(): void {
+    clearTimeout(this.dragTimer);
+    this.dragTimer = undefined;
+    if (this.drag?.kind !== "map" || !this.drag.moved) return;
+    // Pi consumes focus-out before extension listeners; expired native capture cancels the timer.
+    const capture = (this.viewport.tui.valueOf() as { mouseCapture?: { component: Component } }).mouseCapture;
+    if (this.disposed || !this.viewport.mounted || this.viewport.tui.hasOverlay() || capture?.component !== this) {
+      this.cancelDrag();
+      if (!this.disposed) this.viewport.tui.requestRender();
+      return;
+    }
+    const snapshot = this.viewport.snapshot();
+    this.viewport.scrollTo(Math.round(this.drag.position * Math.max(0, snapshot.contentHeight - snapshot.height)), true);
+  }
+
   private failMinimap(error: unknown): void {
     if (this.disposed) return;
+    if (this.drag?.kind === "map") this.cancelDrag();
     this.minimapFailure = error instanceof Error ? error.message : String(error);
     this.warn(`Pixel minimap unavailable: ${this.minimapFailure}. Check runtime dependencies and fonts, then /reload.`);
     this.graphics?.dispose();
@@ -86,12 +113,14 @@ export class Sidebar implements Component {
 
   setMinimap(enabled: boolean): void {
     this.experimentalMinimap = enabled; this.minimapFailure = ""; this.warned = "";
+    if (this.drag?.kind === "map") this.cancelDrag();
     this.map.dispose(); this.resize(); this.viewport.tui.requestRender(true);
   }
-  invalidate(): void { this.map.clear(); }
+  invalidate(): void { if (this.drag?.kind === "map") this.cancelDrag(); this.map.clear(); }
 
   render(width: number): string[] {
     const snapshot = this.viewport.snapshot();
+    if (this.drag?.kind === "map" && (snapshot.width !== this.drag.width || snapshot.height !== this.drag.height)) this.cancelDrag();
     if (snapshot.anchors !== this.rendered?.anchors || snapshot.contentHeight !== this.rendered.contentHeight || snapshot.height !== this.rendered.height) {
       this.tracks = buckets(snapshot.anchors, snapshot.contentHeight, snapshot.height);
     }
@@ -99,6 +128,7 @@ export class Sidebar implements Component {
     const miniWidth = Math.max(0, width - 3);
     const cells = getCellDimensions();
     const mapGeometry = miniWidth ? minimapGeometry(snapshot, miniWidth * cells.widthPx, snapshot.height * cells.heightPx) : undefined;
+    const mapTop = this.drag?.kind === "map" && mapGeometry ? this.drag.position * mapGeometry.travel : mapGeometry?.top;
     const geometry = thumb(snapshot.top, snapshot.contentHeight, snapshot.height);
     const theme = this.ctx.ui.theme;
     return Array.from({ length: snapshot.height }, (_, row) => {
@@ -107,7 +137,7 @@ export class Sidebar implements Component {
       if (entries.length > 1) mark = "≡ ";
       else if (entries.length) mark = "━ ";
       const inView = row >= geometry.top && row < geometry.top + geometry.size;
-      const inMapView = mapGeometry && row + 1 > mapGeometry.top && row < mapGeometry.top + mapGeometry.size;
+      const inMapView = mapGeometry && mapTop !== undefined && row + 1 > mapTop && row < mapTop + mapGeometry.size;
       const mapRow = " ".repeat(miniWidth);
       return (inMapView ? theme.bg("selectedBg", mapRow) : mapRow) +
         theme.fg("accent", mark) + theme.fg(inView ? "scrollbarThumb" : "scrollbarTrack", inView ? "┃" : "│");
@@ -118,8 +148,11 @@ export class Sidebar implements Component {
     const snapshot = this.rendered;
     if (!snapshot || !this.viewport.mounted) return undefined;
     // Pi can cancel capture on focus loss without delivering a release to this component.
-    if (event.type === "press") { this.drag = undefined; this.suppressClick = false; }
-    if (event.type === "wheel") { this.closePopup(); this.viewport.scrollBy(event.wheelDelta ?? 0); return { handled: true }; }
+    if (event.type === "press") { this.cancelDrag(); this.suppressClick = false; }
+    if (event.type === "wheel") {
+      if (this.drag?.kind === "map") { this.cancelDrag(); this.suppressClick = false; }
+      this.closePopup(); this.viewport.scrollBy(event.wheelDelta ?? 0); return { handled: true };
+    }
     const group = this.tracks[event.y] ?? [];
     const marker = event.x >= event.width - 3 && event.x < event.width - 1;
     const onThumbLane = event.x === event.width - 1;
@@ -130,7 +163,7 @@ export class Sidebar implements Component {
       ? minimapGeometry(snapshot, miniWidth * cells.widthPx, snapshot.height * cells.heightPx) : undefined;
     if (event.type === "move") {
       const wasDragging = !!this.drag;
-      this.drag = undefined;
+      this.cancelDrag();
       this.suppressClick = false;
       if (marker && group.length > 1) this.openPopup(group, event);
       // Keep the popup reachable while crossing the experimental minimap to its left.
@@ -140,9 +173,10 @@ export class Sidebar implements Component {
     if (event.type === "press" && event.button === "left") {
       this.closePopup();
       if (onMap && mapGeometry && event.y + 1 > mapGeometry.top && event.y < mapGeometry.top + mapGeometry.size) {
-        this.drag = { kind: "map", grab: event.y - mapGeometry.top };
+        this.drag = { kind: "map", grab: event.y - mapGeometry.top, position: mapGeometry.max ? snapshot.top / mapGeometry.max : 0, moved: false, width: snapshot.width, height: snapshot.height };
         this.suppressClick = true;
-        return { capture: true };
+        if (!this.graphics?.redraw()) this.viewport.tui.requestRender();
+        return { capture: true, render: false };
       }
       if (onThumbLane) {
         const geometry = thumb(snapshot.top, snapshot.contentHeight, snapshot.height);
@@ -156,18 +190,19 @@ export class Sidebar implements Component {
     }
     if (event.type === "drag" && this.drag) {
       const latest = this.viewport.snapshot();
-      let row = this.drag.kind === "map" && mapGeometry
-        ? minimapDragTop(event.y, this.drag.grab, minimapGeometry(latest, miniWidth * cells.widthPx, latest.height * cells.heightPx))
-        : dragTop(event.y, this.drag.grab, latest.contentHeight, latest.height);
-      // Cell-level mouse hits can grab above/below the actual fractional-row rectangle.
       if (this.drag.kind === "map") {
-        if (event.y <= 0) row = 0;
-        else if (event.y >= latest.height - 1) row = Math.max(0, latest.contentHeight - latest.height);
-      }
-      this.viewport.scrollTo(row, true);
+        const geometry = minimapGeometry(latest, miniWidth * cells.widthPx, latest.height * cells.heightPx);
+        this.drag.position = geometry.travel ? Math.max(0, Math.min(geometry.travel, event.y - this.drag.grab)) / geometry.travel : 0;
+        // Cell-level mouse hits can grab outside the actual fractional-row rectangle.
+        if (event.y <= 0) this.drag.position = 0;
+        else if (event.y >= latest.height - 1) this.drag.position = 1;
+        this.drag.moved = true;
+        if (!this.graphics?.redraw()) this.viewport.tui.requestRender();
+        if (this.drag?.kind === "map" && !this.dragTimer) this.dragTimer = setTimeout(() => this.flushMapDrag(), DRAG_SCROLL_MS);
+      } else this.viewport.scrollTo(dragTop(event.y, this.drag.grab, latest.contentHeight, latest.height), true);
       return { capture: true, render: false };
     }
-    if (event.type === "release") { this.drag = undefined; return { handled: true }; }
+    if (event.type === "release") { this.flushMapDrag(); this.cancelDrag(); return { handled: true }; }
     if (event.type === "click" && event.button === "left") {
       if (this.suppressClick) { this.suppressClick = false; return { handled: true }; }
       if (onMap && mapGeometry) this.viewport.scrollTo(Math.round(mapGeometry.start + (event.y + 0.5) * mapGeometry.count / Math.max(1, snapshot.height) - snapshot.height / 2));
@@ -232,7 +267,7 @@ export class Sidebar implements Component {
   }
 
   dispose(): void {
-    this.disposed = true; this.closePopup(); this.removeInput();
+    this.disposed = true; this.cancelDrag(); this.closePopup(); this.removeInput();
     this.graphics?.dispose(); this.graphics = undefined; this.map.dispose();
   }
 }

@@ -1,4 +1,4 @@
-import { encodeITerm2, getCapabilities, getCellDimensions, sliceByColumn, visibleWidth, type Component, type ImageProtocol, type TUI } from "@earendil-works/pi-tui";
+import { encodeITerm2, getCapabilities, getCellDimensions, sliceByColumn, visibleWidth, type CellDimensions, type Component, type ImageProtocol, type TUI } from "@earendil-works/pi-tui";
 import { KittyLayers } from "./kitty.ts";
 import type { MinimapLayers } from "./minimap.ts";
 
@@ -37,10 +37,11 @@ export class GraphicMinimap {
   private painted = false;
   private lastImage?: Buffer;
   private lastBox = "";
+  private shown?: { root: Box; rect: { x: number; y: number; width: number; height: number }; cells: CellDimensions };
   private queriedSize = "";
   private disposed = false;
 
-  constructor(private tui: TUI, private component: Component, private png: (width: number, height: number, protocol: Exclude<ImageProtocol, null>) => GraphicImage | undefined, private failed: (error: unknown) => void) {
+  constructor(private tui: TUI, private component: Component, private png: (width: number, height: number, protocol: Exclude<ImageProtocol, null>, preview: boolean) => GraphicImage | undefined, private failed: (error: unknown) => void) {
     this.tui = tui.valueOf() as TUI;
     const host = renderer(this.tui);
     if (typeof host.doRender !== "function" || typeof host.resetRenderState !== "function" || typeof host.getScreenLines !== "function") throw new Error("Pi 1.5.2 frame compositor is unavailable.");
@@ -84,13 +85,27 @@ export class GraphicMinimap {
     host.doRender = this.wrapped;
   }
 
+  /** Paint only the cached image cells on pointer input; do not render history or walk its layout. */
+  redraw(): boolean {
+    const shown = this.shown, cells = getCellDimensions(), protocol = minimapProtocol(this.tui);
+    if (this.disposed || !this.painted || !shown || !protocol || this.tui.hasOverlay() ||
+        renderer(this.tui).currentLayout?.root !== shown.root || cells.widthPx !== shown.cells.widthPx || cells.heightPx !== shown.cells.heightPx) return false;
+    try {
+      const image = this.png(shown.rect.width * cells.widthPx, shown.rect.height * cells.heightPx, protocol, true);
+      if (!image) return false;
+      const sequence = this.paint(image, shown.rect, cells, true, false);
+      if (sequence) this.tui.terminal.write(`${BEGIN}${sequence}${END}`);
+      return true;
+    } catch (error) { this.failed(error); return false; }
+  }
+
   private draw(before: string[], frame: { output: string }): string {
     const cleared = frame.output.includes("\x1b[2J") || /\x1b_Ga=d,d=[aA],/.test(frame.output);
     const protocol = minimapProtocol(this.tui);
     const root = renderer(this.tui).currentLayout?.root;
     const visit = (box: Box): Box | undefined => box.component === this.component ? box : box.children.map(visit).find(Boolean);
     const box = root && visit(root);
-    if (!protocol || !box || box.rect.width <= 3 || box.rect.height < 1) {
+    if (!protocol || !root || !box || box.rect.width <= 3 || box.rect.height < 1) {
       if (this.painted) {
         this.tui.requestRender(true);
         return this.clearImage();
@@ -104,7 +119,7 @@ export class GraphicMinimap {
     // Fullscreen Pi skips this query for iTerm2 after disabling generic images. Its normal input
     // handler still consumes the reply and updates cell dimensions; do not change capabilities.
     const cells = getCellDimensions();
-    const image = this.png(width * cells.widthPx, height * cells.heightPx, protocol);
+    const image = this.png(width * cells.widthPx, height * cells.heightPx, protocol, false);
     if (!image) {
       if (!this.painted) return query;
       if (!cleared) this.tui.requestRender(true);
@@ -114,15 +129,22 @@ export class GraphicMinimap {
     const position = `${x}:${y}:${width}:${height}`;
     const preserved = this.painted && !cleared && this.lastBox === position &&
       this.preserveImage(frame, before, after, x, y, width, height);
+    this.shown = { root, rect: { x, y, width, height }, cells: { ...cells } };
+    return query + this.paint(image, this.shown.rect, cells, preserved, cleared);
+  }
+
+  private paint(image: GraphicImage, box: { x: number; y: number; width: number; height: number }, cells: CellDimensions, preserved: boolean, cleared: boolean): string {
+    const { x, y, width, height } = box;
+    const position = `${x}:${y}:${width}:${height}`;
     if (image.protocol === "kitty") {
       this.kitty ??= new KittyLayers();
-      const sequence = this.kitty.draw(image.layers, { x, y, width, height }, cells, preserved, cleared);
+      const sequence = this.kitty.draw(image.layers, box, cells, preserved, cleared);
       this.painted = true;
       this.lastImage = undefined;
       this.lastBox = position;
-      return sequence ? `${query}${SAVE}${sequence}${RESTORE}` : query;
+      return sequence ? `${SAVE}${sequence}${RESTORE}` : "";
     }
-    if (preserved && this.lastImage === image.png) return query;
+    if (preserved && this.lastImage === image.png) return "";
     const remove = this.kitty?.clear() ?? "";
     this.painted = true;
     this.lastImage = image.png;
@@ -130,7 +152,7 @@ export class GraphicMinimap {
     const sequence = encodeITerm2(image.png.toString("base64"), { width, height, preserveAspectRatio: false, inline: true });
     // Exact cell bounds are essential: preserveAspectRatio can silently letterbox the image
     // when terminal metrics are rounded or a cell-size reply has not arrived yet.
-    return `${query}${SAVE}${remove}\x1b[${y + 1};${x + 1}H${sequence}${RESTORE}`;
+    return `${SAVE}${remove}\x1b[${y + 1};${x + 1}H${sequence}${RESTORE}`;
   }
 
   private preserveImage(frame: { output: string }, before: string[], after: string[], x: number, y: number, width: number, height: number): boolean {
@@ -155,6 +177,7 @@ export class GraphicMinimap {
   private clearImage(): string {
     this.painted = false;
     this.lastImage = undefined;
+    this.shown = undefined;
     return this.kitty?.clear() ?? "";
   }
 
