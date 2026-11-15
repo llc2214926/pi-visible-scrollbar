@@ -4,6 +4,7 @@ import type { Snapshot } from "./model.ts";
 import { rasterPng, rectanglePng, viewportPng } from "./png.ts";
 
 const CONTENT_REFRESH_MS = 80;
+const PREPARE_SLICE_MS = 2;
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 function rasterSize(width: number, height: number): [number, number] {
   width = Math.max(8, Math.round(width)); height = Math.max(1, Math.round(height));
@@ -131,6 +132,7 @@ export class Minimap {
   private timer?: ReturnType<typeof setTimeout>;
   private requested?: Request;
   private pending?: Request;
+  private preparing = false;
   private running?: { request: Request; id: number; epoch: number };
   private epoch = 0;
   private serial = 0;
@@ -149,7 +151,7 @@ export class Minimap {
   geometry?: MiniGeometry;
 
   constructor(private ready: () => void = () => {}, private failed: (error: unknown) => void = () => {}) {}
-  get isPending(): boolean { return !!(this.running || this.pending || this.timer); }
+  get isPending(): boolean { return !!(this.preparing || this.running || this.pending || this.timer); }
 
   render(snapshot: Snapshot, width: number, height: number, dark: boolean, dragging = false, position?: DragPosition): Buffer | undefined {
     const frame = this.frame(snapshot, width, height, dark, position);
@@ -217,61 +219,75 @@ export class Minimap {
   }
 
   private schedule(): void {
-    if (!this.pending || this.running || this.timer) return;
+    if (!this.pending || this.preparing || this.running || this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      try { this.start(); } catch (error) { this.fail(error); }
+      void this.start().catch(error => this.fail(error));
     }, Math.max(0, this.nextRenderAt - performance.now()));
   }
 
-  private start(): void {
-    const request = this.pending;
+  private async start(): Promise<void> {
+    const request = this.pending, epoch = this.epoch;
     if (!request) return;
-    if (!this.worker) {
-      const worker = new Worker(new URL("./minimap-worker.mjs", import.meta.url), {
-        // The plain ESM raster stage needs no host/test flags; many process flags are invalid in workers.
-        execArgv: [],
-      });
-      this.worker = worker;
-      worker.on("message", (message: { id: number; pixels?: Uint8Array; error?: string }) => {
-        if (this.worker !== worker || this.running?.id !== message.id) return;
-        const job = this.running;
-        this.running = undefined;
-        worker.unref();
-        if (job.epoch === this.epoch) {
-          if (message.error || message.pixels?.byteLength !== job.request.width * job.request.height * 4) {
-            this.fail(new Error(message.error || "Invalid minimap raster")); return;
+    this.preparing = true;
+    try {
+      if (!this.worker) {
+        const worker = new Worker(new URL("./minimap-worker.mjs", import.meta.url), {
+          // The plain ESM raster stage needs no host/test flags; many process flags are invalid in workers.
+          execArgv: [],
+        });
+        this.worker = worker;
+        worker.on("message", (message: { id: number; pixels?: Uint8Array; error?: string }) => {
+          if (this.worker !== worker || this.running?.id !== message.id) return;
+          const job = this.running;
+          this.running = undefined;
+          worker.unref();
+          if (job.epoch === this.epoch) {
+            if (message.error || message.pixels?.byteLength !== job.request.width * job.request.height * 4) {
+              this.fail(new Error(message.error || "Invalid minimap raster")); return;
+            }
+            this.pixels = message.pixels;
+            this.completed = job.request;
+            this.rasterVersion++;
+            this.ready();
           }
-          this.pixels = message.pixels;
-          this.completed = job.request;
-          this.rasterVersion++;
-          this.ready();
-        }
-        this.schedule();
-      });
-      worker.on("error", error => { if (this.worker === worker) this.fail(error); });
-      worker.on("exit", () => { if (this.worker === worker) this.fail(new Error("Minimap worker exited unexpectedly")); });
-    }
-    const foreground = request.dark ? "#d4d4d4" : "#333333";
-    const widths = new Map<string, number>();
-    const rows = request.lines.map(line => {
-      const key = `${request.columns}:${foreground}:${line}`;
-      let runs = this.prepared.get(key);
-      if (!runs) {
-        runs = coloredRuns(sliceByColumn(line, 0, request.columns, true), foreground).map(run => ({
-          column: run.column, color: run.color, glyphs: Array.from(segmenter.segment(run.text), part => part.segment),
-        }));
-        this.prepared.set(key, runs);
+          this.schedule();
+        });
+        worker.on("error", error => { if (this.worker === worker) this.fail(error); });
+        worker.on("exit", () => { if (this.worker === worker) this.fail(new Error("Minimap worker exited unexpectedly")); });
+        worker.unref();
       }
-      for (const run of runs) for (const glyph of run.glyphs) if (!widths.has(glyph)) widths.set(glyph, visibleWidth(glyph));
-      return runs;
-    });
-    while (this.prepared.size > 512) this.prepared.delete(this.prepared.keys().next().value!);
-    this.pending = undefined;
-    this.running = { request, id: ++this.serial, epoch: this.epoch };
-    this.nextRenderAt = performance.now() + CONTENT_REFRESH_MS;
-    this.worker.ref();
-    this.worker.postMessage({ id: this.serial, frame: { ...request, lines: undefined, rows, widths } });
+      const foreground = request.dark ? "#d4d4d4" : "#333333";
+      const widths = new Map<string, number>(), rows: { column: number; color: string; glyphs: string[] }[][] = [];
+      let yieldAt = performance.now() + PREPARE_SLICE_MS;
+      for (const line of request.lines) {
+        const key = `${request.columns}:${foreground}:${line}`;
+        let runs = this.prepared.get(key);
+        if (!runs) {
+          runs = coloredRuns(sliceByColumn(line, 0, request.columns, true), foreground).map(run => ({
+            column: run.column, color: run.color, glyphs: Array.from(segmenter.segment(run.text), part => part.segment),
+          }));
+          this.prepared.set(key, runs);
+        }
+        for (const run of runs) for (const glyph of run.glyphs) if (!widths.has(glyph)) widths.set(glyph, visibleWidth(glyph));
+        rows.push(runs);
+        while (this.prepared.size > 512) this.prepared.delete(this.prepared.keys().next().value!);
+        // Glyph preparation is main-thread work too; let pointer input run between short batches.
+        if (performance.now() >= yieldAt) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          if (epoch !== this.epoch || this.pending !== request) return;
+          yieldAt = performance.now() + PREPARE_SLICE_MS;
+        }
+      }
+      this.pending = undefined;
+      this.running = { request, id: ++this.serial, epoch };
+      this.nextRenderAt = performance.now() + CONTENT_REFRESH_MS;
+      this.worker.ref();
+      this.worker.postMessage({ id: this.serial, frame: { ...request, lines: undefined, rows, widths } });
+    } finally {
+      this.preparing = false;
+      this.schedule();
+    }
   }
 
   private fail(error: unknown): void {

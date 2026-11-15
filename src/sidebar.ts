@@ -136,7 +136,7 @@ export class Sidebar implements Component {
       if (entries.length > 1) mark = "≡ ";
       else if (entries.length) mark = "━ ";
       const inView = row >= geometry.top && row < geometry.top + geometry.size;
-      const inMapView = mapGeometry && mapTop !== undefined && row + 1 > mapTop && row < mapTop + mapGeometry.size;
+      const inMapView = mapGeometry && mapTop !== undefined && row + 0.5 >= mapTop && row + 0.5 < mapTop + mapGeometry.size;
       const mapRow = " ".repeat(miniWidth);
       return (inMapView ? theme.bg("selectedBg", mapRow) : mapRow) +
         theme.fg("accent", mark) + theme.fg(inView ? "scrollbarThumb" : "scrollbarTrack", inView ? "┃" : "│");
@@ -156,7 +156,7 @@ export class Sidebar implements Component {
     const marker = event.x >= event.width - 3 && event.x < event.width - 1;
     const onThumbLane = event.x === event.width - 1;
     const miniWidth = Math.max(0, event.width - 3);
-    const onMap = event.x < miniWidth;
+    const onMap = event.x >= 0 && event.x < miniWidth;
     const cells = getCellDimensions();
     const mapGeometry = onMap || this.drag?.kind === "map"
       ? minimapGeometry(snapshot, miniWidth * cells.widthPx, snapshot.height * cells.heightPx) : undefined;
@@ -171,7 +171,8 @@ export class Sidebar implements Component {
     }
     if (event.type === "press" && event.button === "left") {
       this.closePopup();
-      if (onMap && mapGeometry && event.y + 1 > mapGeometry.top && event.y < mapGeometry.top + mapGeometry.size) {
+      // Mouse reports cells: use their centers, not a whole row that merely touches the frame.
+      if (onMap && mapGeometry && event.y + 0.5 >= mapGeometry.top && event.y + 0.5 < mapGeometry.top + mapGeometry.size) {
         this.drag = { kind: "map", grab: event.y - mapGeometry.top, position: mapGeometry.max ? snapshot.top / mapGeometry.max : 0, moved: false };
         this.suppressClick = true;
         if (!this.graphics?.redraw()) this.viewport.tui.requestRender();
