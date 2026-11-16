@@ -62,14 +62,14 @@ export class Viewport {
   private preparationBookmark?: { id: string; offset: number };
   private disposed = false;
 
-  constructor(readonly tui: TUI, ctx: ExtensionContext) {
+  constructor(readonly tui: TUI, ctx: ExtensionContext, getHideThinkingBlock: () => boolean = () => false) {
     this.mount = findMount(tui);
     const { scroll, document, chat } = this.mount;
     this.scrollbar = scroll.scrollbar;
     this.history = new History(document, chat, ctx, tui, error => {
       this.failure = error instanceof Error ? error.message : String(error);
       this.dispose();
-    });
+    }, getHideThinkingBlock);
     this.originalScrollTo = scroll.scrollTo.bind(scroll);
     // Native input is consumed before extension listeners; cancel at the shared navigation methods,
     // including no-op Ctrl+End. Internal layout restoration uses the saved scrollTo instead.

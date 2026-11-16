@@ -85,6 +85,8 @@ export class GraphicMinimap {
     host.doRender = this.wrapped;
   }
 
+  get isPainted(): boolean { return this.painted; }
+
   /** Paint only the cached image cells on pointer input; do not render history or walk its layout. */
   redraw(): boolean {
     const shown = this.shown, cells = getCellDimensions(), protocol = minimapProtocol(this.tui);

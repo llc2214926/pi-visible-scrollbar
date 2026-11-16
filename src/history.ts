@@ -31,7 +31,7 @@ interface ArchiveState {
 
 export function userText(entry: Entry): string | undefined {
   if (entry.type !== "message" || entry.message.role !== "user") return undefined;
-  const content = entry.message.content;
+  const content = entry.message.content ?? [];
   // Pi joins text blocks without inserting separators when it creates the native card.
   return typeof content === "string" ? content : content.filter(c => c.type === "text").map(c => c.text).join("");
 }
@@ -145,6 +145,7 @@ export class History {
   private rawChildren: Component[] = [];
   private archiveCache?: ArchiveState;
   private preparationError?: Error;
+  private hideThinkingBlock = false;
   private owned = new Set<Component>();
   private bound = new Map<Component, { original: Component["render"]; wrapped: Component["render"]; own: boolean; token: number; id: string }>();
   private bindingPass = new Set<Component>();
@@ -163,7 +164,7 @@ export class History {
   private renderCache?: { width: number; marked: string[]; clean: string[]; archive?: { row: number; source: readonly string[] } };
   private anchorById = new Map<string, Anchor>();
 
-  constructor(private document: Component, private chat: Container, private ctx: host.ExtensionContext, private tui: TUI, private onError?: (error: unknown) => void) {
+  constructor(private document: Component, private chat: Container, private ctx: host.ExtensionContext, private tui: TUI, private onError?: (error: unknown) => void, private getHideThinkingBlock: () => boolean = () => false) {
     this.originalRender = document.render;
     this.hadOwnRender = Object.hasOwn(document, "render");
     this.wrappedRender = (width) => {
@@ -311,7 +312,9 @@ export class History {
     const text = userText(entry) ?? prompt.text;
     const skill = host.parseSkillBlock(text);
     if (skill) {
-      group.addChild(new host.SkillInvocationMessageComponent(skill));
+      const component = new host.SkillInvocationMessageComponent(skill);
+      component.setExpanded(this.ctx.ui.getToolsExpanded());
+      group.addChild(component);
       if (skill.userMessage) group.addChild(new host.UserMessageComponent(skill.userMessage));
     } else group.addChild(new host.UserMessageComponent(prompt.text));
     this.bind(group, prompt, archived);
@@ -340,6 +343,7 @@ export class History {
         () => { if (!this.disposed) this.tui.requestRender(); },
         error => { if (!this.disposed) { this.preparationError = error instanceof Error ? error : new Error(String(error)); this.tui.requestRender(); } },
         this.archiveMarker,
+        this.hideThinkingBlock,
       );
       component.addChild(new Text(" Earlier history · read-only · model context unchanged", 0, 1));
       state = { key, count, built: 0, lastId, component, users: new Map(), tools: new Map(), footer: new Text(" End of earlier history", 0, 1) };
@@ -368,12 +372,16 @@ export class History {
     }
     for (const message of host.sessionEntryToContextMessages(entry)) {
       if (message.role === "assistant") {
-        archive.addChild(new host.AssistantMessageComponent(message, true));
+        archive.addChild(new host.AssistantMessageComponent(message, this.hideThinkingBlock));
         for (const content of message.content) {
           if (content.type !== "toolCall") continue;
           // An empty renderer selects Pi's expandable fallbacks, not its legacy full-output path.
           const tool = new host.ToolExecutionComponent(content.name, content.id, content.arguments, { showImages: false }, {}, this.tui, this.ctx.cwd);
           tool.setExpanded(this.ctx.ui.getToolsExpanded());
+          if (message.stopReason === "aborted" || message.stopReason === "error") {
+            const text = message.errorMessage || (message.stopReason === "aborted" ? "Operation aborted" : "Error");
+            tool.updateResult({ content: [{ type: "text", text }], isError: true });
+          }
           tools.set(content.id, tool);
           archive.addChild(tool);
         }
@@ -445,6 +453,12 @@ export class History {
   private sync(): void {
     if (this.disposed) return;
     if (this.preparationError) throw this.preparationError;
+    // Pi's native thinking toggle only visits top-level cards, not our archived descendants.
+    const hidden = this.getHideThinkingBlock();
+    if (hidden !== this.hideThinkingBlock) {
+      this.hideThinkingBlock = hidden;
+      this.archiveCache?.component.setHideThinkingBlock(hidden);
+    }
     const leaf = this.ctx.sessionManager.getLeafId();
     const raw = this.chat.children.filter(c => !this.owned.has(c));
     const changed = raw.length !== this.rawChildren.length || raw.some((c, i) => c !== this.rawChildren[i]);

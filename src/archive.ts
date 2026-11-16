@@ -9,8 +9,9 @@ const PREPARE_BUDGET_MS = 4;
 class ArchivedChunk extends Container {
   private widths = new Map<number, string[]>();
   private epoch: number;
-  constructor(private collecting: () => boolean, private changed: () => void, private currentEpoch: () => number) {
-    super(); this.epoch = currentEpoch();
+  private hideThinkingBlock: boolean;
+  constructor(private collecting: () => boolean, private changed: () => void, private currentEpoch: () => number, private currentHideThinkingBlock: () => boolean) {
+    super(); this.epoch = currentEpoch(); this.hideThinkingBlock = currentHideThinkingBlock();
   }
   has(width: number): boolean { return this.epoch === this.currentEpoch() && this.widths.has(width); }
   clearCache(): void { this.widths.clear(); this.changed(); }
@@ -19,6 +20,11 @@ class ArchivedChunk extends Container {
     if (this.epoch !== this.currentEpoch()) {
       this.epoch = this.currentEpoch();
       this.widths.clear();
+      const hidden = this.currentHideThinkingBlock();
+      if (hidden !== this.hideThinkingBlock) {
+        this.hideThinkingBlock = hidden;
+        for (const child of this.children) if (child instanceof host.AssistantMessageComponent) child.setHideThinkingBlock(hidden);
+      }
       super.invalidate();
     }
     if (!this.collecting()) return super.render(width);
@@ -30,6 +36,8 @@ class ArchivedChunk extends Container {
     return lines;
   }
   addChild(component: Component): void {
+    // Keep a partly built chunk uniform until its lazy settings update, even across rapid toggles.
+    if (component instanceof host.AssistantMessageComponent && this.hideThinkingBlock !== this.currentHideThinkingBlock()) component.setHideThinkingBlock(this.hideThinkingBlock);
     const watch = (child: Component) => {
       if (child instanceof host.ToolExecutionComponent || child instanceof host.SkillInvocationMessageComponent || child instanceof host.CustomMessageComponent) {
         const original = child.setExpanded;
@@ -72,6 +80,7 @@ export class ArchivedHistory extends Container {
     private ready: () => void,
     private failed: (error: unknown) => void,
     private marker = "",
+    private hideThinkingBlock = false,
   ) { super(); }
 
   get collectedLines(): readonly string[] | undefined { return this.cached?.lines; }
@@ -109,7 +118,7 @@ export class ArchivedHistory extends Container {
   addChild(component: Component): void {
     let chunk = this.children.at(-1) as ArchivedChunk | undefined;
     if (!chunk || chunk.children.length >= CHUNK_SIZE) {
-      chunk = new ArchivedChunk(this.collecting, () => this.changed(), () => this.epoch);
+      chunk = new ArchivedChunk(this.collecting, () => this.changed(), () => this.epoch, () => this.hideThinkingBlock);
       super.addChild(chunk);
     }
     chunk.addChild(component);
@@ -177,6 +186,11 @@ export class ArchivedHistory extends Container {
   private cancelPreparation(): void {
     clearTimeout(this.preparation?.timer);
     this.preparation = undefined;
+  }
+  setHideThinkingBlock(hidden: boolean): void {
+    if (hidden === this.hideThinkingBlock) return;
+    this.hideThinkingBlock = hidden;
+    this.clearCache();
   }
   setExpanded(expanded: boolean): void { for (const child of this.children) (child as ArchivedChunk).setExpanded(expanded); }
   dispose(): void {

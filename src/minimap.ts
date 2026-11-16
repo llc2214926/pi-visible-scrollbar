@@ -1,4 +1,4 @@
-import { getCellDimensions, sliceByColumn, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { getCellDimensions, sliceByColumn, stripTerminalSequences, visibleWidth, type ImageProtocol } from "@earendil-works/pi-tui";
 import { Worker } from "node:worker_threads";
 import type { Snapshot } from "./model.ts";
 import { rasterPng, rectanglePng, viewportPng } from "./png.ts";
@@ -83,10 +83,6 @@ export function minimapGeometry(snapshot: Snapshot, widthPx: number, heightPx: n
   const travel = Math.max(0, Math.min(snapshot.height - size, max * rowScale));
   const samples = Math.max(0, Math.min(snapshot.contentHeight, Math.ceil(start + count)) - Math.floor(start));
   return { start, count, samples, fontSize, lineHeight, top: max ? position / max * travel : 0, size, travel, max };
-}
-
-export function minimapDragTop(pointer: number, grab: number, geometry: MiniGeometry): number {
-  return geometry.travel ? Math.round(Math.max(0, Math.min(geometry.travel, pointer - grab)) * geometry.max / geometry.travel) : 0;
 }
 
 export interface MinimapLayers {
@@ -180,12 +176,24 @@ export class Minimap {
     return { background: this.background.png, backgroundTop: frame.offset, backgroundHeight: frame.height, viewport: this.rectangle.png, top: frame.top / frame.height, fullHeight: frame.bottom - frame.top === frame.height };
   }
 
+  viewportBounds(width: number, height: number, protocol: ImageProtocol): { top: number; bottom: number } | undefined {
+    const [rasterWidth, rasterHeight] = rasterSize(width, height), frame = this.displayed;
+    if (frame?.width !== rasterWidth || frame.height !== rasterHeight) return undefined;
+    if (protocol === "kitty") {
+      // Match KittyLayers: column-scaled height and integer physical-pixel placement after raster limits.
+      const size = frame.bottom - frame.top === rasterHeight ? height : Math.round((frame.bottom - frame.top) * width / rasterWidth);
+      const top = Math.max(0, Math.min(height - size, Math.round(frame.top / rasterHeight * height)));
+      return { top: top / height, bottom: (top + size) / height };
+    }
+    return { top: frame.top / rasterHeight, bottom: frame.bottom / rasterHeight };
+  }
+
   private previewFrame(top: number, width: number, height: number): MiniFrame | undefined {
     const frame = this.displayed;
     if (!frame || frame.width !== width || frame.height !== height) return undefined;
     const size = frame.bottom - frame.top;
     top = Math.max(0, Math.min(height - size, Math.round(top * height)));
-    return { ...frame, top, bottom: top + size };
+    return this.displayed = { ...frame, top, bottom: top + size };
   }
 
   private frame(snapshot: Snapshot, width: number, height: number, dark: boolean, position?: DragPosition): MiniFrame | undefined {

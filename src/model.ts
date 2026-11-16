@@ -32,16 +32,6 @@ export function label(text: string): string {
   return stripTerminalSequences(text).replace(/[\x00-\x1f\x7f-\x9f]/g, " ").trim().replace(/\s+/g, " ") || "[Empty input]";
 }
 
-export function buckets(anchors: readonly Anchor[], total: number, height: number): Anchor[][] {
-  const result: Anchor[][] = Array.from({ length: Math.max(0, height) }, () => []);
-  if (!height) return result;
-  for (const anchor of anchors) {
-    const row = Math.min(height - 1, Math.max(0, Math.floor(anchor.row * height / Math.max(total, height))));
-    result[row].push(anchor);
-  }
-  return result;
-}
-
 /** Count markers in O(screen rows × log inputs); expand only the requested popup page. */
 export function bucketRanges(anchors: readonly Anchor[], total: number, height: number): AnchorRange[] {
   let start = 0;

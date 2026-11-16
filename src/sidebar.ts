@@ -13,7 +13,7 @@ export class Sidebar implements Component {
   private tracks: AnchorRange[] = [];
   private minimapLayout = false;
   private terminalSize = "";
-  private drag?: { kind: "thumb"; grab: number } | { kind: "map"; grab: number; position: number; moved: boolean };
+  private drag?: { kind: "thumb"; grab: number } | { kind: "map"; grab: number; row: number; position: number; moved: boolean };
   private dragTimer?: ReturnType<typeof setTimeout>;
   private suppressClick = false;
   private graphics?: GraphicMinimap;
@@ -172,9 +172,13 @@ export class Sidebar implements Component {
     }
     if (event.type === "press" && event.button === "left") {
       this.closePopup();
-      // Mouse reports cells: use their centers, not a whole row that merely touches the frame.
-      if (onMap && mapGeometry && event.y + 0.5 >= mapGeometry.top && event.y + 0.5 < mapGeometry.top + mapGeometry.size) {
-        this.drag = { kind: "map", grab: event.y - mapGeometry.top, position: mapGeometry.max ? snapshot.top / mapGeometry.max : 0, moved: false };
+      // Hit the rounded pixels that are actually displayed, not the ideal fractional rectangle.
+      const bounds = onMap && this.graphics?.isPainted
+        ? this.map.viewportBounds(miniWidth * cells.widthPx, snapshot.height * cells.heightPx, minimapProtocol(this.viewport.tui)) : undefined;
+      const pointer = (event.y + 0.5) / Math.max(1, snapshot.height);
+      if (mapGeometry && bounds && pointer >= bounds.top && pointer < bounds.bottom) {
+        // Keep continuous scroll coordinates so a same-cell move does not quantize the reading position.
+        this.drag = { kind: "map", grab: event.y - mapGeometry.top, row: event.y, position: mapGeometry.max ? snapshot.top / mapGeometry.max : 0, moved: false };
         this.suppressClick = true;
         if (!this.graphics?.redraw()) this.viewport.tui.requestRender();
         return { capture: true, render: false };
@@ -192,6 +196,9 @@ export class Sidebar implements Component {
     if (event.type === "drag" && this.drag) {
       const latest = this.viewport.snapshot();
       if (this.drag.kind === "map") {
+        // Repeated cell reports are not movement, even in the top/bottom endpoint cells.
+        if (event.y === this.drag.row) return { capture: true, render: false };
+        this.drag.row = event.y;
         const geometry = minimapGeometry(latest, miniWidth * cells.widthPx, latest.height * cells.heightPx);
         this.drag.position = geometry.travel ? Math.max(0, Math.min(geometry.travel, event.y - this.drag.grab)) / geometry.travel : 0;
         // Cell-level mouse hits can grab outside the actual fractional-row rectangle.

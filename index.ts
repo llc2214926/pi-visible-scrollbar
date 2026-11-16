@@ -35,7 +35,7 @@ export default function visibleScrollbar(pi: ExtensionAPI): void {
         let candidate: Viewport | undefined;
         try {
           if (!active) {
-            candidate = new Viewport(tui, ctx);
+            candidate = new Viewport(tui, ctx, () => pi.getSettings().hideThinkingBlock ?? false);
             const sidebar = new Sidebar(candidate, ctx, config.experimentalMinimap);
             active = { viewport: candidate, sidebar };
           }
