@@ -12,12 +12,25 @@ interface NativeFields {
   lastMessage?: { timestamp?: unknown };
   message?: { customType?: unknown; content?: unknown };
   status?: unknown;
+  messageId?: unknown;
+  markdownTransformers?: unknown;
+  mouseLayout?: { width: number; children: { component: Component; height: number }[] };
 }
 function nativeFields(component: Component): NativeFields {
   // SAFETY: Pi's private card fields are read-only here; every consumed field is checked at runtime.
   return component as unknown as NativeFields;
 }
 interface Boundary { component: Component; slot: number; signature: string; prompt: boolean }
+interface RenderSpan { row: number; source: readonly string[]; run?: { from: number; end: number; first: number; next: number } }
+interface NativeRender {
+  original: Component["render"];
+  wrapped: Component["render"];
+  own: boolean;
+  cacheable: boolean;
+  widths: Map<number, string[]>;
+  source?: string[];
+  restore: (() => void)[];
+}
 interface ArchiveState {
   key: string;
   count: number;
@@ -143,11 +156,23 @@ export class History {
   private supplements = new Map<string, Component>();
   private leaf: string | null | undefined;
   private rawChildren: Component[] = [];
+  private childrenAtSync?: Component[];
+  private childrenLength = -1;
+  private rawChanged = false;
+  private observingRaw = false;
+  private rawCursor = 0;
+  private nativeSourcesChanged = true;
+  private chatHeight = -1;
+  private spanOffset = -1;
+  private nativeRenderers = new Map<Component, NativeRender>();
+  private originalChatRender: Component["render"];
+  private wrappedChatRender: Component["render"];
+  private restoreChat: (() => void)[] = [];
   private archiveCache?: ArchiveState;
   private preparationError?: Error;
   private hideThinkingBlock = false;
   private owned = new Set<Component>();
-  private bound = new Map<Component, { original: Component["render"]; wrapped: Component["render"]; own: boolean; token: number; id: string }>();
+  private bound = new Map<Component, { original: Component["render"]; wrapped: Component["render"]; own: boolean; token: number; id: string; marked?: string[]; clear: () => void }>();
   private bindingPass = new Set<Component>();
   private nativeBound = new Set<Component>();
   private tokenSerial = 0;
@@ -161,56 +186,170 @@ export class History {
   private originalRender: Component["render"];
   private wrappedRender: Component["render"];
   private hadOwnRender: boolean;
-  private renderCache?: { width: number; marked: string[]; clean: string[]; archive?: { row: number; source: readonly string[] } };
+  private renderCache?: { width: number; marked: string[]; clean: string[]; archive?: { row: number; source: readonly string[] }; spans?: RenderSpan[]; spanOffset?: number };
   private anchorById = new Map<string, Anchor>();
+  private frameCache?: Map<number, string[]>;
 
   constructor(private document: Component, private chat: Container, private ctx: host.ExtensionContext, private tui: TUI, private onError?: (error: unknown) => void, private getHideThinkingBlock: () => boolean = () => false) {
     this.originalRender = document.render;
     this.hadOwnRender = Object.hasOwn(document, "render");
-    this.wrappedRender = (width) => {
-      try { this.sync(); }
-      catch (error) {
-        this.dispose();
-        if (!this.onError) throw error;
-        this.onError(error);
-        return this.originalRender.call(document, width);
+    this.originalChatRender = chat.render;
+    const ownChat = Object.getOwnPropertyDescriptor(chat, "render");
+    this.wrappedChatRender = width => {
+      this.observingRaw = this.collecting && this.originalChatRender === Container.prototype.render;
+      this.rawCursor = 0;
+      this.rawChanged = false;
+      this.nativeSourcesChanged = false;
+      try {
+        const lines = this.originalChatRender.call(chat, width);
+        if (this.collecting) {
+          if (lines.length !== this.chatHeight) this.nativeSourcesChanged = true;
+          this.chatHeight = lines.length;
+        }
+        return lines;
       }
+      finally {
+        if (this.observingRaw && this.rawCursor !== this.rawChildren.length) this.rawChanged = true;
+        this.observingRaw = false;
+      }
+    };
+    chat.render = this.wrappedChatRender;
+    this.restoreChat.push(() => {
+      if (chat.render !== this.wrappedChatRender) return;
+      if (ownChat) Object.defineProperty(chat, "render", ownChat);
+      else delete (chat as Partial<Container>).render;
+    });
+    for (const key of ["addChild", "removeChild", "clear"] as const) {
+      const original = chat[key], own = Object.getOwnPropertyDescriptor(chat, key);
+      const wrapped = (...args: Component[]) => { this.invalidate(); return original.apply(chat, args as [Component]); };
+      chat[key] = wrapped;
+      this.restoreChat.push(() => {
+        if (chat[key] !== wrapped) return;
+        if (own) Object.defineProperty(chat, key, own);
+        else delete (chat as Partial<Container>)[key];
+      });
+    }
+    this.wrappedRender = (width) => {
+      const ready = this.frameCache?.get(width);
+      if (ready && this.width === width && this.lines === ready) return ready;
+      try { this.sync(); }
+      catch (error) { return this.restoreOnError(error, width); }
       this.collecting = true;
       let rendered: string[];
-      try { rendered = this.originalRender.call(document, width); }
+      try {
+        rendered = this.originalRender.call(document, width);
+        // Validate topology during Pi's existing child traversal, not with another scan on every key.
+        if (this.rawChanged && chat.render === this.wrappedChatRender) {
+          try {
+            this.dirty = true;
+            this.sync();
+            rendered = this.originalRender.call(document, width);
+            if (this.rawChanged) throw new Error("Transcript components changed while rendering");
+          } catch (error) { return this.restoreOnError(error, width); }
+        }
+      }
       finally { this.collecting = false; }
-      return this.collectLines(rendered, width);
+      const lines = this.collectLines(rendered, width);
+      this.frameCache?.set(width, lines);
+      return lines;
     };
     document.render = this.wrappedRender;
   }
+
+  private restoreOnError(error: unknown, width: number): string[] {
+    this.collecting = false;
+    this.dispose();
+    if (!this.onError) throw error;
+    this.onError(error);
+    return this.originalRender.call(this.document, width);
+  }
+
+  beginFrame(): void { this.frameCache = new Map(); }
+  endFrame(): void { this.frameCache = undefined; }
 
   private archiveSpan(rendered: readonly string[]): { row: number; source: readonly string[] } | undefined {
     const archive = this.archiveCache?.component, source = archive?.collectedLines;
     // Only native concatenation guarantees that our immutable block is copied verbatim.
     // A foreign renderer keeps the fully checked path, even if it preserves the boundary marker.
-    if (!source?.length || this.originalRender !== Container.prototype.render || this.chat.render !== Container.prototype.render ||
-        archive?.render !== ArchivedHistory.prototype.render) return undefined;
+    if (!source?.length || this.originalRender !== Container.prototype.render || this.chat.render !== this.wrappedChatRender ||
+        this.originalChatRender !== Container.prototype.render || archive?.render !== ArchivedHistory.prototype.render) return undefined;
     const row = rendered.indexOf(source[0]);
     if (row >= 0 && rendered[row + source.length - 1] === source[source.length - 1]) return { row, source };
     return undefined;
   }
 
+  private nativeSpans(rendered: readonly string[], width: number): RenderSpan[] {
+    this.spanOffset = -1;
+    if (this.originalRender !== Container.prototype.render || this.chat.render !== this.wrappedChatRender ||
+        this.originalChatRender !== Container.prototype.render) return [];
+    const document = nativeFields(this.document).mouseLayout, chat = nativeFields(this.chat).mouseLayout;
+    if (document?.width !== width || chat?.width !== width || !Array.isArray(document.children) || !Array.isArray(chat.children)) return [];
+    let offset = 0;
+    let foundChat = false;
+    for (const child of document.children) {
+      if (child.component === this.chat) { foundChat = true; break; }
+      if (!Number.isInteger(child.height) || child.height < 0) return [];
+      offset += child.height;
+    }
+    if (!foundChat) return [];
+    this.spanOffset = offset;
+    const cached = this.renderCache;
+    if (!this.nativeSourcesChanged && cached?.width === width && cached.spanOffset === offset && cached.spans) return cached.spans;
+    const spans: RenderSpan[] = [];
+    for (const child of chat.children) {
+      if (!Number.isInteger(child.height) || child.height < 0) return [];
+      const state = this.nativeRenderers.get(child.component), binding = this.bound.get(child.component);
+      const source = state?.cacheable && state.widths.get(width) === state.source &&
+        (child.component.render === state.wrapped || child.component.render === binding?.wrapped)
+        ? binding?.marked ?? state.source : undefined;
+      if (source?.length === child.height && source.length && rendered[offset] === source[0] &&
+          rendered[offset + source.length - 1] === source[source.length - 1]) spans.push({ row: offset, source });
+      offset += child.height;
+    }
+    let run: RenderSpan["run"];
+    for (let i = 0; i < spans.length; i++) {
+      const span = spans[i];
+      if (!run || run.end !== span.row) run = { from: span.row, end: span.row, first: i, next: i };
+      run.end += span.source.length; run.next = i + 1;
+      span.run = run;
+    }
+    return spans;
+  }
+
   private collectLines(rendered: string[], width: number): string[] {
-    const cached = this.renderCache, archive = this.archiveSpan(rendered);
+    const cached = this.renderCache, archive = this.archiveSpan(rendered), spans = this.nativeSpans(rendered, width);
     const sameArchive = archive && cached?.archive?.source === archive.source;
     let from = 0, oldEnd = cached?.marked.length ?? 0, end = rendered.length;
     if (cached) {
+      const previous = cached.spans ?? [];
+      let nextSpan = 0, oldSpan = 0;
       while (from < Math.min(oldEnd, end)) {
-        if (sameArchive && from === archive.row && from === cached.archive!.row) from += archive.source.length;
+        while (nextSpan < spans.length && spans[nextSpan].row < from) nextSpan++;
+        while (oldSpan < previous.length && previous[oldSpan].row < from) oldSpan++;
+        const next = spans[nextSpan], old = previous[oldSpan];
+        if (spans === previous && next?.row === from && next.run) {
+          from = next.run.end; nextSpan = oldSpan = next.run.next;
+        } else if (next?.row === from && old?.row === from && next.source === old.source) from += next.source.length;
+        else if (sameArchive && from === archive.row && from === cached.archive!.row) from += archive.source.length;
         else if (rendered[from] === cached.marked[from]) from++;
         else break;
       }
       if (from === oldEnd && from === end) {
-        cached.archive = archive; cached.width = width; this.width = width;
+        cached.archive = archive; cached.spans = spans; cached.spanOffset = this.spanOffset; cached.width = width; this.width = width;
         return cached.clean;
       }
+      nextSpan = spans.length - 1; oldSpan = previous.length - 1;
       while (oldEnd > from && end > from) {
-        if (sameArchive && archive.row >= from && end === archive.row + archive.source.length &&
+        while (nextSpan >= 0 && spans[nextSpan].row + spans[nextSpan].source.length > end) nextSpan--;
+        while (oldSpan >= 0 && previous[oldSpan].row + previous[oldSpan].source.length > oldEnd) oldSpan--;
+        const next = spans[nextSpan], old = previous[oldSpan];
+        if (spans === previous && next?.run && next.run.from >= from && oldEnd === end &&
+            next.row + next.source.length === end) {
+          end = oldEnd = next.run.from; nextSpan = oldSpan = next.run.first - 1;
+        } else if (next && old && next.row >= from && old.row >= from && next.row + next.source.length === end &&
+            old.row + old.source.length === oldEnd && next.source === old.source) {
+          end -= next.source.length; oldEnd -= old.source.length;
+        } else if (sameArchive && archive.row >= from && end === archive.row + archive.source.length &&
             oldEnd === cached.archive!.row + archive.source.length) {
           end -= archive.source.length; oldEnd -= archive.source.length;
         } else if (rendered[end - 1] === cached.marked[oldEnd - 1]) { oldEnd--; end--; }
@@ -242,7 +381,7 @@ export class History {
     this.lines = clean;
     this.width = width;
     // Native Container allocates a new array every render. Other renderers may reuse mutable arrays.
-    this.renderCache = { width, marked: this.originalRender === Container.prototype.render ? rendered : rendered.slice(), clean, archive };
+    this.renderCache = { width, marked: this.originalRender === Container.prototype.render ? rendered : rendered.slice(), clean, archive, spans, spanOffset: this.spanOffset };
     return clean;
   }
 
@@ -263,7 +402,7 @@ export class History {
   anchor(id: string): Anchor | undefined { return this.anchorById.get(id); }
 
   get isPending(): boolean { return this.archiveCache?.component.isPending ?? false; }
-  invalidate(): void { this.dirty = true; }
+  invalidate(): void { this.dirty = true; this.frameCache?.clear(); }
 
   hasPrompt(id: string): boolean { return this.promptById.has(id); }
   promptRank(id: string): number { return this.promptRanks.get(id) ?? -1; }
@@ -280,15 +419,24 @@ export class History {
     let cached: { source: string[]; marked: string[] } | undefined;
     const wrapped = (width: number) => {
       const lines = original.call(component, width);
-      if (!this.collecting || !lines.length) return lines;
-      if (cached && lines.length === cached.source.length && lines.every((line, i) => line === cached!.source[i])) return cached.marked;
+      if (this.disposed || !this.collecting || this.bound.get(component)?.wrapped !== wrapped || !lines.length) return lines;
+      const trusted = this.nativeRenderers.get(component)?.widths.get(width) === lines;
+      const prior = cached;
+      if (prior && ((trusted && lines === prior.source) || (lines.length === prior.source.length && lines.every((line, i) => line === prior.source[i])))) {
+        if (trusted) prior.source = lines;
+        const binding = this.bound.get(component);
+        if (binding) binding.marked = prior.marked;
+        return prior.marked;
+      }
       const marked = lines.slice();
       marked[0] = `${this.marker}s;${token}\x07${marked[0]}`;
       marked[marked.length - 1] += `${this.marker}e;${token}\x07`;
-      cached = { source: lines.slice(), marked };
+      cached = { source: trusted ? lines : lines.slice(), marked };
+      const binding = this.bound.get(component);
+      if (binding) binding.marked = marked;
       return marked;
     };
-    this.bound.set(component, { original, wrapped, own: Object.hasOwn(component, "render"), token, id: prompt.id });
+    this.bound.set(component, { original, wrapped, own: Object.hasOwn(component, "render"), token, id: prompt.id, clear: () => { cached = undefined; } });
     component.render = wrapped;
   }
 
@@ -300,6 +448,7 @@ export class History {
         if (binding.own) component.render = binding.original;
         else delete (component as Partial<Component>).render;
       }
+      binding.clear(); binding.marked = undefined;
       this.bound.delete(component);
       this.nativeBound.delete(component);
       this.tokens.delete(binding.token);
@@ -450,6 +599,87 @@ export class History {
     if (retained !== this.prompts.length || added.length) this.prompts = this.prompts.slice(0, retained).concat(added);
   }
 
+  private watchNative(component: Component): void {
+    const previous = this.nativeRenderers.get(component), binding = this.bound.get(component);
+    if (previous && (component.render === previous.wrapped ||
+        (component.render === binding?.wrapped && binding.original === previous.wrapped))) return;
+    if (previous) { this.unbind([component]); this.releaseNative(component); }
+    const original = component.render;
+    const prototype = component.constructor === host.UserMessageComponent ? host.UserMessageComponent.prototype
+      : component.constructor === host.AssistantMessageComponent ? host.AssistantMessageComponent.prototype : undefined;
+    const transforms = prototype ? nativeFields(component).markdownTransformers : undefined;
+    const state: NativeRender = {
+      original, wrapped: original, own: Object.hasOwn(component, "render"),
+      cacheable: !!prototype && original === prototype.render && !(Array.isArray(transforms) && transforms.length),
+      widths: new Map(), restore: [],
+    };
+    const wrapped = (width: number) => {
+      if (this.disposed || this.nativeRenderers.get(component) !== state) return original.call(component, width);
+      if (this.observingRaw && this.rawChildren[this.rawCursor++] !== component) this.rawChanged = true;
+      if (component.render !== wrapped) {
+        const binding = this.bound.get(component);
+        if (component.render !== binding?.wrapped || binding.original !== wrapped) {
+          this.rawChanged = true; this.nativeSourcesChanged = true; state.cacheable = false; state.widths.clear(); state.source = undefined;
+        }
+      }
+      if (state.cacheable) {
+        const transforms = nativeFields(component).markdownTransformers;
+        if (Array.isArray(transforms) && transforms.length) {
+          state.cacheable = false; state.widths.clear(); state.source = undefined; this.nativeSourcesChanged = true;
+        }
+      }
+      let lines = this.collecting && state.cacheable ? state.widths.get(width) : undefined;
+      if (!lines) {
+        lines = original.call(component, width);
+        if (this.collecting && state.cacheable) {
+          state.widths.set(width, lines);
+          if (state.widths.size > 2) state.widths.delete(state.widths.keys().next().value!);
+        }
+      }
+      if (this.collecting) {
+        if (!state.source || (state.cacheable ? state.source !== lines : state.source.length !== lines.length)) this.nativeSourcesChanged = true;
+        state.source = lines;
+      }
+      return lines;
+    };
+    state.wrapped = wrapped;
+    this.nativeRenderers.set(component, state);
+    if (state.cacheable) {
+      type Mutation = "invalidate" | "addChild" | "removeChild" | "clear" | "rebuild" | "updateContent";
+      // SAFETY: Only the native methods below are wrapped, after checking their function and descriptor capabilities.
+      const mutations = component as unknown as Partial<Record<Mutation, (...args: unknown[]) => unknown>>;
+      const methods: Mutation[] = ["invalidate", "addChild", "removeChild", "clear", prototype === host.UserMessageComponent.prototype ? "rebuild" : "updateContent"];
+      for (const key of methods) {
+        const method = mutations[key], own = Object.getOwnPropertyDescriptor(component, key);
+        if (typeof method !== "function" || (own && !own.configurable && !own.writable)) { state.cacheable = false; continue; }
+        const invalidate = (...args: unknown[]) => {
+          state.widths.clear();
+          this.frameCache?.clear();
+          return method.apply(component, args);
+        };
+        mutations[key] = invalidate;
+        state.restore.push(() => {
+          if (mutations[key] !== invalidate) return;
+          if (own) Object.defineProperty(component, key, own);
+          else delete mutations[key];
+        });
+      }
+    }
+    component.render = wrapped;
+  }
+
+  private releaseNative(component: Component): void {
+    const state = this.nativeRenderers.get(component);
+    if (!state) return;
+    this.nativeRenderers.delete(component);
+    if (component.render === state.wrapped) {
+      if (state.own) component.render = state.original;
+      else delete (component as Partial<Component>).render;
+    }
+    for (const restore of state.restore.splice(0).reverse()) restore();
+    state.widths.clear(); state.source = undefined;
+  }
+
   private sync(): void {
     if (this.disposed) return;
     if (this.preparationError) throw this.preparationError;
@@ -460,16 +690,23 @@ export class History {
       this.archiveCache?.component.setHideThinkingBlock(hidden);
     }
     const leaf = this.ctx.sessionManager.getLeafId();
+    if (!this.dirty && leaf === this.leaf && !this.rawChanged && this.chat.children === this.childrenAtSync &&
+        this.chat.children.length === this.childrenLength && this.chat.render === this.wrappedChatRender &&
+        this.originalChatRender === Container.prototype.render) return;
     const raw = this.chat.children.filter(c => !this.owned.has(c));
-    const changed = raw.length !== this.rawChildren.length || raw.some((c, i) => c !== this.rawChildren[i]);
-    if (!this.dirty && leaf === this.leaf && !changed) return;
+    const changed = this.rawChanged || raw.length !== this.rawChildren.length || raw.some((c, i) => c !== this.rawChildren[i]);
+    this.rawChanged = false;
     const oldLength = this.signatures.length;
     const from = this.ancestry.sync(this.ctx.sessionManager);
     this.dirty = false;
     this.leaf = leaf;
-    if (from === oldLength && this.branch.length === oldLength && !changed) return;
+    if (from === oldLength && this.branch.length === oldLength && !changed) {
+      this.childrenAtSync = this.chat.children; this.childrenLength = this.chat.children.length;
+      return;
+    }
     this.indexBranch(from);
     this.rawChildren = raw;
+    for (const component of raw) this.watchNative(component);
     const prompts = this.promptById;
     this.bindingPass.clear();
     this.chat.children = raw.slice();
@@ -480,7 +717,10 @@ export class History {
     // Backward matching distinguishes repeated identical prompts in a retained suffix.
     for (let i = native.length - 1; i >= 0; i--) {
       const boundary = native[i];
-      const index = this.match(boundary.signature, cursor);
+      const id = nativeFields(boundary.component).messageId;
+      const identified = typeof id === "string" ? this.ancestry.indexOf(id) : undefined;
+      const index = identified !== undefined && identified <= cursor && this.signatures[identified] === boundary.signature
+        ? identified : this.match(boundary.signature, cursor);
       if (index < 0) continue; // A streaming card can precede persistence of its entry.
       matches.push({ boundary, index });
       cursor = index - 1;
@@ -524,6 +764,8 @@ export class History {
     }
     for (const [id, component] of this.supplements) if (!this.owned.has(component)) this.supplements.delete(id);
     for (const component of this.nativeBound) if (!this.bindingPass.has(component)) this.unbind([component]);
+    const presentRaw = new Set(raw);
+    for (const component of this.nativeRenderers.keys()) if (!presentRaw.has(component)) this.releaseNative(component);
     if (!additions.size) this.chat.children = raw;
     else {
       const children: Component[] = [];
@@ -533,6 +775,7 @@ export class History {
       }
       this.chat.children = children;
     }
+    this.childrenAtSync = this.chat.children; this.childrenLength = this.chat.children.length;
   }
 
   dispose(): void {
@@ -540,6 +783,8 @@ export class History {
     this.disposed = true;
     this.archiveCache?.component.dispose();
     this.unbind();
+    for (const component of this.nativeRenderers.keys()) this.releaseNative(component);
+    for (const restore of this.restoreChat.reverse()) restore();
     this.chat.children = this.chat.children.filter(c => !this.owned.has(c));
     this.owned.clear();
     if (this.document.render === this.wrappedRender) {
@@ -555,11 +800,13 @@ export class History {
     this.signatures = [];
     this.signaturePositions.clear();
     this.rawChildren = [];
+    this.childrenAtSync = undefined;
     this.promptById.clear();
     this.promptRanks.clear();
     this.supplements.clear();
     this.bindingPass.clear();
     this.archiveCache = undefined;
+    this.frameCache = undefined;
     this.renderCache = undefined;
   }
 }

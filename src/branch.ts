@@ -38,6 +38,8 @@ export class SessionBranch {
     return prefix;
   }
 
+  indexOf(id: string): number | undefined { return this.positions.get(id); }
+
   clear(): void {
     this.entries.length = 0;
     this.positions.clear();

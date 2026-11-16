@@ -87,13 +87,13 @@ export class GraphicMinimap {
 
   get isPainted(): boolean { return this.painted; }
 
-  /** Paint only the cached image cells on pointer input; do not render history or walk its layout. */
-  redraw(): boolean {
+  /** Paint only our image cells; pointer previews use the cached raster without reading history. */
+  redraw(preview = true): boolean {
     const shown = this.shown, cells = getCellDimensions(), protocol = minimapProtocol(this.tui);
     if (this.disposed || !this.painted || !shown || !protocol || this.tui.hasOverlay() ||
         renderer(this.tui).currentLayout?.root !== shown.root || cells.widthPx !== shown.cells.widthPx || cells.heightPx !== shown.cells.heightPx) return false;
     try {
-      const image = this.png(shown.rect.width * cells.widthPx, shown.rect.height * cells.heightPx, protocol, true);
+      const image = this.png(shown.rect.width * cells.widthPx, shown.rect.height * cells.heightPx, protocol, preview);
       if (!image) return false;
       const sequence = this.paint(image, shown.rect, cells, true, false);
       if (sequence) this.tui.terminal.write(`${BEGIN}${sequence}${END}`);

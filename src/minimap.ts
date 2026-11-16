@@ -1,7 +1,7 @@
 import { getCellDimensions, sliceByColumn, stripTerminalSequences, visibleWidth, type ImageProtocol } from "@earendil-works/pi-tui";
 import { Worker } from "node:worker_threads";
 import type { Snapshot } from "./model.ts";
-import { rasterPng, rectanglePng, viewportPng } from "./png.ts";
+import { rasterPng, rasterPngAsync, rectanglePng, viewportPng, viewportPngAsync } from "./png.ts";
 
 const CONTENT_REFRESH_MS = 80;
 const PREPARE_SLICE_MS = 2;
@@ -105,6 +105,14 @@ interface MiniFrame {
   version: number;
 }
 interface DragPosition { top: number; preview?: boolean }
+function viewportRect(geometry: MiniGeometry, rows: number, height: number, position?: DragPosition): { top: number; bottom: number } {
+  const size = Math.max(1, Math.min(height, Math.round(geometry.size / Math.max(1, rows) * height)));
+  const top = Math.max(0, Math.min(height - size, Math.round((position?.top ?? geometry.top / Math.max(1, rows)) * height)));
+  return { top, bottom: top + size };
+}
+function imageKey(frame: Pick<MiniFrame, "version" | "offset" | "top" | "bottom">, dark: boolean, dragging: boolean): string {
+  return `${frame.version}:${frame.offset}:${frame.top}:${frame.bottom}:${dark}:${dragging}`;
+}
 
 interface Request {
   key: string;
@@ -116,6 +124,8 @@ interface Request {
   sourceRows: number[];
   geometry: MiniGeometry;
   dark: boolean;
+  layers: boolean;
+  view: { offset: number; height: number; top: number; bottom: number };
 }
 function sameRequest(a: Request, b?: Request): boolean {
   return !!b && a.key === b.key && a.offset === b.offset && a.height === b.height && a.lines.length === b.lines.length &&
@@ -142,6 +152,7 @@ export class Minimap {
   private png?: Buffer;
   private pngKey = "";
   private background?: { version: number; png: Buffer };
+  private encoded?: { version: number; background?: Buffer; composite?: { key: string; png: Buffer } };
   private rectangle?: { key: string; png: Buffer };
   private pixels?: Uint8Array;
   private rasterVersion = 0;
@@ -158,19 +169,26 @@ export class Minimap {
   render(snapshot: Snapshot, width: number, height: number, dark: boolean, dragging = false, position?: DragPosition): Buffer | undefined {
     const frame = this.frame(snapshot, width, height, dark, position);
     if (!frame) return undefined;
-    const pngKey = `${frame.version}:${frame.offset}:${frame.top}:${frame.bottom}:${dark}:${dragging}`;
+    const pngKey = imageKey(frame, dark, dragging);
     if (pngKey !== this.pngKey) {
-      const pixels = frame.pixels.subarray(frame.offset * frame.width * 4, (frame.offset + frame.height) * frame.width * 4);
-      this.png = viewportPng(pixels, frame.width, frame.height, frame.top, frame.bottom, dark, dragging);
+      const encoded = this.encoded?.composite;
+      if (encoded?.key === pngKey) this.png = encoded.png;
+      else {
+        const pixels = frame.pixels.subarray(frame.offset * frame.width * 4, (frame.offset + frame.height) * frame.width * 4);
+        this.png = viewportPng(pixels, frame.width, frame.height, frame.top, frame.bottom, dark, dragging);
+      }
       this.pngKey = pngKey;
     }
     return this.png;
   }
 
   renderLayers(snapshot: Snapshot, width: number, height: number, dark: boolean, dragging = false, position?: DragPosition): MinimapLayers | undefined {
-    const frame = this.frame(snapshot, width, height, dark, position);
+    const frame = this.frame(snapshot, width, height, dark, position, true);
     if (!frame) return undefined;
-    if (this.background?.version !== frame.version) this.background = { version: frame.version, png: rasterPng(frame.pixels, frame.width, frame.rasterHeight) };
+    if (this.background?.version !== frame.version) {
+      const encoded = this.encoded?.version === frame.version ? this.encoded.background : undefined;
+      this.background = { version: frame.version, png: encoded ?? rasterPng(frame.pixels, frame.width, frame.rasterHeight) };
+    }
     const key = `${frame.width}:${frame.bottom - frame.top}:${dark}:${dragging}`;
     if (this.rectangle?.key !== key) this.rectangle = { key, png: rectanglePng(frame.width, frame.bottom - frame.top, dark, dragging) };
     return { background: this.background.png, backgroundTop: frame.offset, backgroundHeight: frame.height, viewport: this.rectangle.png, top: frame.top / frame.height, fullHeight: frame.bottom - frame.top === frame.height };
@@ -196,7 +214,7 @@ export class Minimap {
     return this.displayed = { ...frame, top, bottom: top + size };
   }
 
-  private frame(snapshot: Snapshot, width: number, height: number, dark: boolean, position?: DragPosition): MiniFrame | undefined {
+  private frame(snapshot: Snapshot, width: number, height: number, dark: boolean, position?: DragPosition, layers = false): MiniFrame | undefined {
     if (this.failure) throw this.failure;
     [width, height] = rasterSize(width, height);
     // Pointer feedback uses only the last displayed immutable raster, never history or a worker.
@@ -205,12 +223,13 @@ export class Minimap {
     this.geometry = geometry;
     const key = `${width}:${height}:${snapshot.width}:${geometry.lineHeight}:${dark}`;
     const viewOffset = Math.round(geometry.start * geometry.lineHeight);
+    const rectangle = viewportRect(geometry, snapshot.height, height, position);
     const covers = (request?: Request) => !!request && request.key === key && viewOffset >= request.offset && viewOffset + height <= request.offset + request.height;
     if (!covers(this.requested) || this.sourceLines !== snapshot.lines) {
-      // Cache up to three map screens, not the full history; nearby scrolling is just a pixel crop.
-      const cacheHeight = Math.max(height, Math.min(4096, height * 3, Math.ceil(snapshot.contentHeight * geometry.lineHeight)));
+      // Reserve forward pixels even past the current end, so new streamed rows do not clear a valid image.
+      const cacheHeight = Math.max(height, Math.min(4096, height * 3));
       const offset = covers(this.requested) && this.requested!.height === cacheHeight ? this.requested!.offset
-        : Math.max(0, Math.min(Math.round(snapshot.contentHeight * geometry.lineHeight) - cacheHeight, viewOffset - height));
+        : Math.max(0, viewOffset - Math.floor((cacheHeight - height) / 2));
       const first = Math.floor(offset / geometry.lineHeight);
       const end = Math.min(snapshot.contentHeight, Math.ceil((offset + cacheHeight) / geometry.lineHeight));
       const previous = this.requested;
@@ -220,7 +239,8 @@ export class Minimap {
         const sourceRows = Array.from({ length: Math.max(0, end - first) }, (_, i) => first + i);
         const request: Request = {
           key, lines: sourceRows.map(row => snapshot.lines[row] ?? ""), sourceRows, width, height: cacheHeight, offset,
-          columns: snapshot.width, geometry: { ...geometry, start: offset / geometry.lineHeight }, dark,
+          columns: snapshot.width, geometry: { ...geometry, start: offset / geometry.lineHeight }, dark, layers,
+          view: { offset: viewOffset - offset, height, ...rectangle },
         };
         if (!sameRequest(request, previous)) {
           this.requested = this.pending = request;
@@ -231,9 +251,7 @@ export class Minimap {
     }
     // During a drag the rectangle stays responsive while the independent background catches up.
     if (!this.pixels || !covers(this.completed)) return position ? this.previewFrame(position.top, width, height) : undefined;
-    const size = Math.max(1, Math.min(height, Math.round(geometry.size / Math.max(1, snapshot.height) * height)));
-    const top = Math.max(0, Math.min(height - size, Math.round((position?.top ?? geometry.top / Math.max(1, snapshot.height)) * height)));
-    return this.displayed = { width, height, offset: viewOffset - this.completed!.offset, top, bottom: top + size,
+    return this.displayed = { width, height, offset: viewOffset - this.completed!.offset, ...rectangle,
       pixels: this.pixels, rasterHeight: this.completed!.height, version: this.rasterVersion };
   }
 
@@ -256,18 +274,38 @@ export class Minimap {
           execArgv: [],
         });
         this.worker = worker;
-        worker.on("message", (message: { id: number; pixels?: Uint8Array; error?: string }) => {
+        worker.on("message", async (message: { id: number; pixels?: Uint8Array; error?: string }) => {
           if (this.worker !== worker || this.running?.id !== message.id) return;
-          const job = this.running;
+          const job = this.running, request = job.request, view = request.view;
+          let pixels: Uint8Array | undefined, png: Buffer | undefined;
+          try {
+            if (job.epoch === this.epoch) {
+              if (message.error || !message.pixels || message.pixels.byteLength !== request.width * request.height * 4) {
+                throw new Error(message.error || "Invalid minimap raster");
+              }
+              pixels = message.pixels;
+              // Keep this latest-only job active until compression finishes off the interactive thread.
+              png = request.layers ? await rasterPngAsync(pixels, request.width, request.height)
+                : await viewportPngAsync(pixels.subarray(view.offset * request.width * 4, (view.offset + view.height) * request.width * 4),
+                  request.width, view.height, view.top, view.bottom, request.dark, false);
+            }
+          } catch (error) {
+            if (this.worker === worker && this.running === job) {
+              this.running = undefined; worker.unref();
+              if (job.epoch === this.epoch) this.fail(error);
+              else this.schedule();
+            }
+            return;
+          }
+          if (this.worker !== worker || this.running !== job) return;
           this.running = undefined;
           worker.unref();
-          if (job.epoch === this.epoch) {
-            if (message.error || message.pixels?.byteLength !== job.request.width * job.request.height * 4) {
-              this.fail(new Error(message.error || "Invalid minimap raster")); return;
-            }
-            this.pixels = message.pixels;
-            this.completed = job.request;
-            this.rasterVersion++;
+          if (job.epoch === this.epoch && pixels && png) {
+            this.pixels = pixels;
+            this.completed = request;
+            const version = ++this.rasterVersion;
+            this.encoded = request.layers ? { version, background: png }
+              : { version, composite: { key: imageKey({ ...view, version }, request.dark, false), png } };
             this.ready();
           }
           this.schedule();
@@ -327,6 +365,7 @@ export class Minimap {
       this.background = this.rectangle = undefined;
       this.displayed = undefined;
     }
+    this.encoded = undefined;
     this.pixels = undefined;
     this.sourceLines = undefined;
     this.completed = undefined;

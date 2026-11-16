@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getCellDimensions, matchesKey, truncateToWidth, visibleWidth, type Component, type OverlayHandle, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { bucketRanges, dragTop, thumb, type Anchor, type AnchorRange, type Snapshot } from "./model.ts";
+import { bucketRanges, type Anchor, type AnchorRange, type Snapshot } from "./model.ts";
 import { Minimap, minimapGeometry } from "./minimap.ts";
 import { GraphicMinimap, minimapProtocol } from "./graphics.ts";
 import { Viewport } from "./viewport.ts";
@@ -13,7 +13,7 @@ export class Sidebar implements Component {
   private tracks: AnchorRange[] = [];
   private minimapLayout = false;
   private terminalSize = "";
-  private drag?: { kind: "thumb"; grab: number } | { kind: "map"; grab: number; row: number; position: number; moved: boolean };
+  private drag?: { kind: "map"; grab: number; row: number; position: number; moved: boolean };
   private dragTimer?: ReturnType<typeof setTimeout>;
   private suppressClick = false;
   private graphics?: GraphicMinimap;
@@ -25,7 +25,11 @@ export class Sidebar implements Component {
   private removeInput: () => void;
 
   constructor(private viewport: Viewport, private ctx: ExtensionContext, private experimentalMinimap: boolean) {
-    this.map = new Minimap(() => { if (!this.disposed) viewport.tui.requestRender(); }, error => this.failMinimap(error));
+    this.map = new Minimap(() => {
+      if (this.disposed || viewport.tui.hasOverlay()) return;
+      if (!this.graphics?.redraw(false)) viewport.tui.requestRender();
+    }, error => this.failMinimap(error));
+    viewport.setGutter(this, 3);
     this.removeInput = viewport.tui.addInputListener(data => {
       if (!this.popup) return undefined;
       if (matchesKey(data, "escape")) { this.closePopup(); return { consume: true }; }
@@ -112,6 +116,9 @@ export class Sidebar implements Component {
   }
 
   setMinimap(enabled: boolean): void {
+    if (enabled === this.experimentalMinimap && !this.minimapFailure) {
+      this.resize(); this.viewport.tui.requestRender(); return;
+    }
     this.experimentalMinimap = enabled; this.minimapFailure = ""; this.warned = "";
     if (this.drag?.kind === "map") this.cancelDrag();
     this.map.dispose(); this.resize(); this.viewport.tui.requestRender(true);
@@ -128,18 +135,15 @@ export class Sidebar implements Component {
     const cells = getCellDimensions();
     const mapGeometry = miniWidth ? minimapGeometry(snapshot, miniWidth * cells.widthPx, snapshot.height * cells.heightPx) : undefined;
     const mapTop = this.drag?.kind === "map" && mapGeometry ? this.drag.position * mapGeometry.travel : mapGeometry?.top;
-    const geometry = thumb(snapshot.top, snapshot.contentHeight, snapshot.height);
     const theme = this.ctx.ui.theme;
     return Array.from({ length: snapshot.height }, (_, row) => {
       const entries = this.tracks[row].end - this.tracks[row].start;
       let mark = "  ";
       if (entries > 1) mark = "≡ ";
       else if (entries) mark = "━ ";
-      const inView = row >= geometry.top && row < geometry.top + geometry.size;
       const inMapView = mapGeometry && mapTop !== undefined && row + 0.5 >= mapTop && row + 0.5 < mapTop + mapGeometry.size;
       const mapRow = " ".repeat(miniWidth);
-      return (inMapView ? theme.bg("selectedBg", mapRow) : mapRow) +
-        theme.fg("accent", mark) + theme.fg(inView ? "scrollbarThumb" : "scrollbarTrack", inView ? "┃" : "│");
+      return (inMapView ? theme.bg("selectedBg", mapRow) : mapRow) + theme.fg("accent", mark) + " ";
     });
   }
 
@@ -150,7 +154,8 @@ export class Sidebar implements Component {
     if (event.type === "press") { this.cancelDrag(); this.suppressClick = false; }
     if (event.type === "wheel") {
       if (this.drag?.kind === "map") { this.cancelDrag(); this.suppressClick = false; }
-      this.closePopup(); this.viewport.scrollBy(event.wheelDelta ?? 0); return { handled: true };
+      this.closePopup(); this.viewport.scrollBy(event.wheelDelta ?? 0, { x: event.screenX, y: event.screenY });
+      return { handled: true, render: false };
     }
     const group = this.tracks[event.y] ?? { start: 0, end: 0 };
     const count = group.end - group.start;
@@ -183,31 +188,23 @@ export class Sidebar implements Component {
         if (!this.graphics?.redraw()) this.viewport.tui.requestRender();
         return { capture: true, render: false };
       }
-      if (onThumbLane) {
-        const geometry = thumb(snapshot.top, snapshot.contentHeight, snapshot.height);
-        const grab = event.y >= geometry.top && event.y < geometry.top + geometry.size ? event.y - geometry.top : Math.floor(geometry.size / 2);
-        this.drag = { kind: "thumb", grab };
-        this.suppressClick = true;
-        this.viewport.scrollTo(dragTop(event.y, grab, snapshot.contentHeight, snapshot.height), true);
-        return { capture: true, render: false };
-      }
+      // Pi owns the last column's thumb, capture and click semantics.
+      if (onThumbLane) return undefined;
       return { handled: true };
     }
     if (event.type === "drag" && this.drag) {
       const latest = this.viewport.snapshot();
-      if (this.drag.kind === "map") {
-        // Repeated cell reports are not movement, even in the top/bottom endpoint cells.
-        if (event.y === this.drag.row) return { capture: true, render: false };
-        this.drag.row = event.y;
-        const geometry = minimapGeometry(latest, miniWidth * cells.widthPx, latest.height * cells.heightPx);
-        this.drag.position = geometry.travel ? Math.max(0, Math.min(geometry.travel, event.y - this.drag.grab)) / geometry.travel : 0;
-        // Cell-level mouse hits can grab outside the actual fractional-row rectangle.
-        if (event.y <= 0) this.drag.position = 0;
-        else if (event.y >= latest.height - 1) this.drag.position = 1;
-        this.drag.moved = true;
-        if (!this.graphics?.redraw()) this.viewport.tui.requestRender();
-        if (this.drag?.kind === "map" && !this.dragTimer) this.dragTimer = setTimeout(() => this.flushMapDrag(), DRAG_SCROLL_MS);
-      } else this.viewport.scrollTo(dragTop(event.y, this.drag.grab, latest.contentHeight, latest.height), true);
+      // Repeated cell reports are not movement, even in the top/bottom endpoint cells.
+      if (event.y === this.drag.row) return { capture: true, render: false };
+      this.drag.row = event.y;
+      const geometry = minimapGeometry(latest, miniWidth * cells.widthPx, latest.height * cells.heightPx);
+      this.drag.position = geometry.travel ? Math.max(0, Math.min(geometry.travel, event.y - this.drag.grab)) / geometry.travel : 0;
+      // Cell-level mouse hits can grab outside the actual fractional-row rectangle.
+      if (event.y <= 0) this.drag.position = 0;
+      else if (event.y >= latest.height - 1) this.drag.position = 1;
+      this.drag.moved = true;
+      if (!this.graphics?.redraw()) this.viewport.tui.requestRender();
+      if (this.drag && !this.dragTimer) this.dragTimer = setTimeout(() => this.flushMapDrag(), DRAG_SCROLL_MS);
       return { capture: true, render: false };
     }
     if (event.type === "release") { this.flushMapDrag(); this.cancelDrag(); return { handled: true }; }
@@ -276,7 +273,9 @@ export class Sidebar implements Component {
   }
 
   dispose(): void {
+    if (this.disposed) return;
     this.disposed = true; this.cancelDrag(); this.closePopup(); this.removeInput();
     this.graphics?.dispose(); this.graphics = undefined; this.map.dispose();
+    this.rendered = undefined; this.tracks = []; this.popupRange = undefined;
   }
 }

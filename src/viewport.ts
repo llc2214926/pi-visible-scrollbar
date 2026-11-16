@@ -1,10 +1,18 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, HStack, ScrollView, type Component, type ScrollViewScrollbar, type StackEntry, type TUI } from "@earendil-works/pi-tui";
+import { Container, ScrollView, compositeTuiLine, sliceByColumn, type Component, type ScrollViewScrollbar, type StackEntry, type TUI } from "@earendil-works/pi-tui";
 import { History } from "./history.ts";
 import { nearestAnchor, type Anchor, type Snapshot } from "./model.ts";
 
 const MINIMAP_RATIO = 0.06;
-interface HostInternals { getMountedRoots?: () => readonly Component[]; requestImmediateRender?: () => void }
+interface Rect { x: number; y: number; width: number; height: number }
+interface LayoutBox { component: Component; rect: Rect; clip: Rect; children: LayoutBox[]; parent?: LayoutBox; scrollView?: ScrollView; layer?: number }
+interface HostInternals {
+  getMountedRoots?: () => readonly Component[];
+  requestImmediateRender?: () => void;
+  routeWheel?: (pointer: { x: number; y: number }, delta: number) => void;
+  doRender?: () => void;
+  compositeScrollToEndIndicator?: (screen: string[], layout: { root: LayoutBox }, width: number) => string[];
+}
 interface StackInternals { entries?: StackEntry[]; children?: Component[] }
 function internals(component: Component): StackInternals {
   // SAFETY: These optional Pi layout fields are validated before mutation, and restored by identity.
@@ -16,7 +24,7 @@ function roots(tui: TUI): readonly Component[] {
   return host.getMountedRoots?.() ?? [];
 }
 
-interface Mount { parent: StackInternals; entry: StackEntry; scroll: ScrollView; document: Container; chat: Container }
+interface Mount { entry: StackEntry; scroll: ScrollView; document: Container; chat: Container }
 function findMount(tui: TUI): Mount {
   if (tui.mode !== "fullscreen") throw new Error("Visible scrollbar requires Pi fullscreen mode.");
   const candidates: Mount[] = [];
@@ -35,7 +43,7 @@ function findMount(tui: TUI): Mount {
             (document as Container).children.length !== 3 || (document as Container).children[2]?.constructor !== Container) {
           throw new Error("Unsupported Pi transcript layout; the original scrollbar was left unchanged.");
         }
-        candidates.push({ parent, entry, scroll: child, document: document as Container, chat: (document as Container).children[2] as Container });
+        candidates.push({ entry, scroll: child, document: document as Container, chat: (document as Container).children[2] as Container });
       } else visit(child);
     }
   }
@@ -48,7 +56,8 @@ export class Viewport {
   readonly history: History;
   failure = "";
   private mount: Mount;
-  private replacement?: HStack;
+  private gutter?: { component: Component; width: number; proportional: boolean };
+  private restoreHost: (() => void)[] = [];
   private scrollbar: ScrollViewScrollbar;
   private originalUpdate: ScrollView["updateLayout"];
   private wrappedUpdate: ScrollView["updateLayout"];
@@ -57,7 +66,6 @@ export class Viewport {
   private restoreNavigation: (() => void)[] = [];
   private previousAnchors: Anchor[] = [];
   private previousTop = -1;
-  private previousHeight = -1;
   private pendingId?: string;
   private preparationBookmark?: { id: string; offset: number };
   private disposed = false;
@@ -66,10 +74,11 @@ export class Viewport {
     this.mount = findMount(tui);
     const { scroll, document, chat } = this.mount;
     this.scrollbar = scroll.scrollbar;
-    this.history = new History(document, chat, ctx, tui, error => {
-      this.failure = error instanceof Error ? error.message : String(error);
-      this.dispose();
-    }, getHideThinkingBlock);
+    const host = tui.valueOf() as HostInternals;
+    if (typeof host.doRender !== "function" || typeof host.compositeScrollToEndIndicator !== "function") {
+      throw new Error("Pi 1.5.2 transcript compositor is unavailable; the native layout was left unchanged.");
+    }
+    this.history = new History(document, chat, ctx, tui, error => this.disable(error), getHideThinkingBlock);
     this.originalScrollTo = scroll.scrollTo.bind(scroll);
     // Native input is consumed before extension listeners; cancel at the shared navigation methods,
     // including no-op Ctrl+End. Internal layout restoration uses the saved scrollTo instead.
@@ -125,47 +134,99 @@ export class Viewport {
       }
       this.previousTop = scroll.scrollTop;
       this.previousAnchors = this.history.anchors;
-      // HStack measures the gutter before allocating the final viewport height.
-      if (this.previousHeight !== height) { this.previousHeight = height; requestRender(); }
     };
     scroll.updateLayout = this.wrappedUpdate;
-    scroll.setScrollbar("hidden");
+    const originalWidth = scroll.getContentWidth;
+    const ownWidth = Object.getOwnPropertyDescriptor(scroll, "getContentWidth");
+    const contentWidth = (available: number) => {
+      if (this.disposed || !this.gutter) return originalWidth.call(scroll, available);
+      const width = this.gutter.width;
+      const reserve = width + (this.gutter.proportional ? Math.round(Math.max(0, available - width) * MINIMAP_RATIO / (1 + MINIMAP_RATIO)) : 0);
+      return Math.max(1, available - reserve);
+    };
+    scroll.getContentWidth = contentWidth;
+    this.restoreHost.push(() => {
+      if (scroll.getContentWidth !== contentWidth) return;
+      if (ownWidth) Object.defineProperty(scroll, "getContentWidth", ownWidth);
+      else delete (scroll as Partial<ScrollView>).getContentWidth;
+    });
+    const originalComposite = host.compositeScrollToEndIndicator;
+    const ownComposite = Object.getOwnPropertyDescriptor(host, "compositeScrollToEndIndicator");
+    const composite = (screen: string[], layout: { root: LayoutBox }, width: number) => {
+      if (!this.disposed) {
+        try { this.paintGutter(screen, layout.root, width); }
+        catch (error) { this.disable(error); }
+      }
+      return originalComposite.call(host, screen, layout, width);
+    };
+    host.compositeScrollToEndIndicator = composite;
+    this.restoreHost.push(() => {
+      if (host.compositeScrollToEndIndicator !== composite) return;
+      if (ownComposite) Object.defineProperty(host, "compositeScrollToEndIndicator", ownComposite);
+      else delete host.compositeScrollToEndIndicator;
+    });
+    const originalRender = host.doRender;
+    const ownRender = Object.getOwnPropertyDescriptor(host, "doRender");
+    const render = () => {
+      if (this.disposed) { originalRender.call(host); return; }
+      this.history.beginFrame();
+      try { originalRender.call(host); }
+      finally { this.history.endFrame(); }
+    };
+    host.doRender = render;
+    this.restoreHost.push(() => {
+      if (host.doRender !== render) return;
+      if (ownRender) Object.defineProperty(host, "doRender", ownRender);
+      else delete host.doRender;
+    });
+    scroll.setScrollbar("always");
+  }
+
+  private disable(error: unknown): void {
+    this.failure = error instanceof Error ? error.message : String(error);
+    this.dispose();
   }
 
   setGutter(component: Component, width: number, proportional = false): void {
-    const { parent, entry, scroll } = this.mount;
-    const previous = this.replacement ?? scroll;
-    let gutter: StackEntry | undefined;
-    // Pi 1.5.2 distributes grow weights sequentially, not proportionally. Measure this slot once
-    // before allocation; body + map + fixed markers = available, with map = body * 6%.
-    const measure: Component = {
-      render(available) { if (gutter) gutter.basis = width + Math.round(Math.max(0, available - width) * MINIMAP_RATIO / (1 + MINIMAP_RATIO)); return []; },
-      invalidate() {},
-    };
-    const replacement = new HStack([
-      { component: scroll, basis: 0, grow: 1, minSize: 1 },
-      ...(proportional ? [{ component: measure, basis: "auto" as const, minSize: 0, maxSize: 0, shrink: 0 }] : []),
-      { component, basis: width, minSize: width, ...(proportional ? {} : { maxSize: width }), shrink: 0 },
-    ]);
-    gutter = internals(replacement).entries!.at(-1);
-    if (entry.component !== previous) throw new Error("Another extension replaced the transcript slot.");
-    const index = parent.children!.indexOf(previous);
-    if (index < 0) throw new Error("The transcript layout changed.");
-    entry.component = replacement;
-    parent.children![index] = replacement;
-    this.replacement = replacement;
+    if (this.mount.entry.component !== this.mount.scroll) throw new Error("Another extension replaced the transcript slot.");
+    this.gutter = { component, width, proportional };
     this.tui.requestRender();
   }
 
+  private paintGutter(screen: string[], root: LayoutBox, width: number): void {
+    const gutter = this.gutter;
+    if (!gutter) return;
+    const find = (box: LayoutBox): LayoutBox | undefined => box.scrollView === this.mount.scroll ? box : box.children.map(find).find(Boolean);
+    const scroll = find(root);
+    if (!scroll || !scroll.children.length) return;
+    const body = scroll.children[0].rect.width;
+    const rect = { x: scroll.rect.x + body, y: scroll.rect.y, width: Math.max(0, scroll.rect.width - body), height: scroll.rect.height };
+    if (rect.width < 2 || rect.height < 1) return;
+    const clip = {
+      x: Math.max(rect.x, scroll.clip.x), y: Math.max(rect.y, scroll.clip.y),
+      width: Math.max(0, Math.min(rect.x + rect.width, scroll.clip.x + scroll.clip.width) - Math.max(rect.x, scroll.clip.x)),
+      height: Math.max(0, Math.min(rect.y + rect.height, scroll.clip.y + scroll.clip.height) - Math.max(rect.y, scroll.clip.y)),
+    };
+    // Add only gutter hit geometry; the native document remains the first child and is never measured again.
+    scroll.children.push({ component: gutter.component, rect, clip, children: [], parent: scroll, layer: scroll.layer });
+    const lines = gutter.component.render(rect.width);
+    const first = Math.max(rect.y, clip.y, 0), end = Math.min(rect.y + rect.height, clip.y + clip.height, screen.length);
+    for (let row = first; row < end; row++) {
+      // The final column is painted and captured by Pi's native scrollbar, not by the extension.
+      const line = sliceByColumn(lines[row - rect.y] ?? "", 0, rect.width - 1, true);
+      screen[row] = compositeTuiLine(screen[row] ?? "", line, rect.x, rect.width - 1, width);
+    }
+  }
+
   get mounted(): boolean {
-    return !this.disposed && this.tui.mode === "fullscreen" && this.mount.entry.component === this.replacement &&
-      roots(this.tui).some(root => contains(root, this.replacement!));
+    return !this.disposed && !!this.gutter && this.tui.mode === "fullscreen" && this.mount.entry.component === this.mount.scroll &&
+      roots(this.tui).some(root => contains(root, this.mount.scroll));
   }
 
   snapshot(): Snapshot {
     const { scroll } = this.mount;
-    // Remember later settings changes, but keep only our custom scrollbar visible while mounted.
-    if (!this.disposed && scroll.scrollbar !== "hidden") { this.scrollbar = scroll.scrollbar; scroll.setScrollbar("hidden"); }
+    // Keep the native scrollbar visible and remember settings changes for cleanup.
+    if (!this.disposed && scroll.scrollbar !== "always") { this.scrollbar = scroll.scrollbar; scroll.setScrollbar("always"); }
     return { anchors: this.history.anchors, lines: this.history.lines, width: this.history.width,
       height: scroll.viewportHeight, top: scroll.scrollTop, contentHeight: this.history.lines.length, preparing: this.history.isPending,
       lineChange: this.history.lineChange };
@@ -194,24 +255,31 @@ export class Viewport {
     if (immediate && typeof host.requestImmediateRender === "function") host.requestImmediateRender();
     else this.tui.requestRender();
   }
-  scrollBy(delta: number): void { this.mount.scroll.scrollBy(delta); this.tui.requestRender(); }
+  scrollBy(delta: number, pointer?: { x: number; y: number }): void {
+    const host = this.tui.valueOf() as HostInternals;
+    if (pointer && typeof host.routeWheel === "function") host.routeWheel(pointer, delta);
+    else { this.mount.scroll.scrollBy(delta); this.tui.requestRender(); }
+  }
   end(): void { this.mount.scroll.scrollToEnd(); this.tui.requestRender(); }
   refresh(): void { this.history.invalidate(); this.tui.requestRender(); }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    const { scroll, entry, parent } = this.mount;
+    const gutter: (Component & { dispose?: () => void }) | undefined = this.gutter?.component;
+    // Dispose the outer image hook before restoring this viewport's inner frame hook.
+    if (typeof gutter?.dispose === "function") gutter.dispose();
+    const { scroll } = this.mount;
     this.history.dispose();
     for (const restore of this.restoreNavigation.splice(0)) restore();
+    for (const restore of this.restoreHost.splice(0).reverse()) restore();
     if (scroll.updateLayout === this.wrappedUpdate) {
       if (this.hadOwnUpdate) scroll.updateLayout = this.originalUpdate;
       else delete (scroll as Partial<ScrollView>).updateLayout;
     }
-    if (scroll.scrollbar === "hidden") scroll.setScrollbar(this.scrollbar);
-    if (entry.component === this.replacement) entry.component = scroll;
-    const index = parent.children?.indexOf(this.replacement!);
-    if (index !== undefined && index >= 0) parent.children![index] = scroll;
+    if (scroll.scrollbar === "always") scroll.setScrollbar(this.scrollbar);
+    this.gutter = undefined;
+    this.previousAnchors = []; this.pendingId = undefined; this.preparationBookmark = undefined;
     this.tui.requestRender();
   }
 }
