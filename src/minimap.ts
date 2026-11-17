@@ -151,7 +151,7 @@ export class Minimap {
   private nextRenderAt = 0;
   private png?: Buffer;
   private pngKey = "";
-  private background?: { version: number; png: Buffer };
+  private background?: { version: number; width: number; height: number; png: Buffer };
   private encoded?: { version: number; background?: Buffer; composite?: { key: string; png: Buffer } };
   private rectangle?: { key: string; png: Buffer };
   private pixels?: Uint8Array;
@@ -161,6 +161,7 @@ export class Minimap {
   private displayed?: MiniFrame;
   private prepared = new Map<string, { column: number; color: string; glyphs: string[] }[]>();
   private failure?: Error;
+  private solidBackground?: { key: string; png: Buffer };
   geometry?: MiniGeometry;
 
   constructor(private ready: () => void = () => {}, private failed: (error: unknown) => void = () => {}) {}
@@ -184,14 +185,34 @@ export class Minimap {
 
   renderLayers(snapshot: Snapshot, width: number, height: number, dark: boolean, dragging = false, position?: DragPosition): MinimapLayers | undefined {
     const frame = this.frame(snapshot, width, height, dark, position, true);
-    if (!frame) return undefined;
+    if (!frame) {
+      // Placeholder only when a cached background already exists; avoids extra uploads on cold start.
+      if (snapshot.preparing) return undefined;
+      const [rasterW, rasterH] = rasterSize(width, height);
+      return this.background?.width === rasterW && this.background?.height === rasterH
+        ? this.placeholder(snapshot, width, height, dark, dragging, position) : undefined;
+    }
     if (this.background?.version !== frame.version) {
       const encoded = this.encoded?.version === frame.version ? this.encoded.background : undefined;
-      this.background = { version: frame.version, png: encoded ?? rasterPng(frame.pixels, frame.width, frame.rasterHeight) };
+      this.background = { version: frame.version, width: frame.width, height: frame.rasterHeight, png: encoded ?? rasterPng(frame.pixels, frame.width, frame.rasterHeight) };
     }
     const key = `${frame.width}:${frame.bottom - frame.top}:${dark}:${dragging}`;
     if (this.rectangle?.key !== key) this.rectangle = { key, png: rectanglePng(frame.width, frame.bottom - frame.top, dark, dragging) };
     return { background: this.background.png, backgroundTop: frame.offset, backgroundHeight: frame.height, viewport: this.rectangle.png, top: frame.top / frame.height, fullHeight: frame.bottom - frame.top === frame.height };
+  }
+
+  private placeholder(snapshot: Snapshot, width: number, height: number, dark: boolean, dragging: boolean, position?: DragPosition): MinimapLayers | undefined {
+    [width, height] = rasterSize(width, height);
+    const geometry = minimapGeometry(snapshot, width, height);
+    this.geometry = geometry;
+    // Reuse the existing cached background PNG instead of uploading a new solid one.
+    const background = this.background?.png ?? this.solidBackground?.png;
+    if (!background) return undefined;
+    // Viewport rectangle position
+    const rect = viewportRect(geometry, snapshot.height, height, position);
+    const rectKey = `${width}:${rect.bottom - rect.top}:${dark}:${dragging}`;
+    if (this.rectangle?.key !== rectKey) this.rectangle = { key: rectKey, png: rectanglePng(width, rect.bottom - rect.top, dark, dragging) };
+    return { background, backgroundTop: 0, backgroundHeight: height, viewport: this.rectangle.png, top: rect.top / height, fullHeight: rect.bottom - rect.top === height };
   }
 
   viewportBounds(width: number, height: number, protocol: ImageProtocol): { top: number; bottom: number } | undefined {
