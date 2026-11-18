@@ -5,6 +5,9 @@ import { anchorIndex, label, nearestAnchor, type Anchor, type LineChange, type P
 import { ArchivedHistory } from "./archive.ts";
 import { SessionBranch } from "./branch.ts";
 
+const ARCHIVE_FRAME_MIN_ROWS = 8192;
+type MouseChildren = { component: Component; height: number }[];
+
 type Entry = host.SessionEntry;
 interface NativeFields {
   text?: unknown;
@@ -14,10 +17,10 @@ interface NativeFields {
   status?: unknown;
   messageId?: unknown;
   markdownTransformers?: unknown;
-  mouseLayout?: { width: number; children: { component: Component; height: number }[] };
+  mouseLayout?: { width: number; children: MouseChildren };
 }
 function nativeFields(component: Component): NativeFields {
-  // SAFETY: Pi's private card fields are read-only here; every consumed field is checked at runtime.
+  // SAFETY: Only stock Container instances have their mouse layout published here.
   return component as unknown as NativeFields;
 }
 interface Boundary { component: Component; slot: number; signature: string; prompt: boolean }
@@ -237,13 +240,15 @@ export class History {
       this.collecting = true;
       let rendered: string[];
       try {
-        rendered = this.originalRender.call(document, width);
+        const archive = this.readyArchiveForFrame();
+        rendered = archive ? this.renderArchivedDocument(width, archive) : this.originalRender.call(document, width);
         // Validate topology during Pi's existing child traversal, not with another scan on every key.
         if (this.rawChanged && chat.render === this.wrappedChatRender) {
           try {
             this.dirty = true;
             this.sync();
-            rendered = this.originalRender.call(document, width);
+            const archive = this.readyArchiveForFrame();
+            rendered = archive ? this.renderArchivedDocument(width, archive) : this.originalRender.call(document, width);
             if (this.rawChanged) throw new Error("Transcript components changed while rendering");
           } catch (error) { return this.restoreOnError(error, width); }
         }
@@ -266,6 +271,65 @@ export class History {
 
   beginFrame(): void { this.frameCache = new Map(); }
   endFrame(): void { this.frameCache = undefined; }
+
+  private readyArchiveForFrame(): ArchivedHistory | undefined {
+    const archive = this.archiveCache?.component;
+    if (!this.frameCache || !archive || (archive.collectedLines?.length ?? 0) < ARCHIVE_FRAME_MIN_ROWS ||
+        this.originalRender !== Container.prototype.render || this.originalChatRender !== Container.prototype.render ||
+        this.document.constructor !== Container || this.chat.constructor !== Container ||
+        this.chat.render !== this.wrappedChatRender || archive.render !== ArchivedHistory.prototype.render ||
+        this.chat.children[0] !== archive) return undefined;
+    return archive;
+  }
+
+  private renderArchivedDocument(width: number, archive: ArchivedHistory): string[] {
+    const document = this.document as Container;
+    // Like Container.render, call children in order and publish immediate-child hit heights.
+    // Keep the immutable archive separate until we know whether the flat document changed.
+    const head: string[] = [], tail: string[] = [], documentChildren: MouseChildren = [];
+    let source: string[] | undefined;
+    for (const component of document.children) {
+      if (component !== this.chat || component.render !== this.wrappedChatRender || source) {
+        const lines = component.render(width);
+        documentChildren.push({ component, height: lines.length });
+        for (const line of lines) (source ? tail : head).push(line);
+        continue;
+      }
+
+      const chatChildren: MouseChildren = [];
+      this.observingRaw = true;
+      this.rawCursor = 0;
+      this.rawChanged = false;
+      this.nativeSourcesChanged = false;
+      let height = 0;
+      try {
+        for (const child of this.chat.children) {
+          const lines = child.render(width);
+          chatChildren.push({ component: child, height: lines.length });
+          height += lines.length;
+          if (child === archive && chatChildren.length === 1 && lines === archive.collectedLines) source = lines;
+          else for (const line of lines) (source ? tail : head).push(line);
+        }
+        if (height !== this.chatHeight) this.nativeSourcesChanged = true;
+        this.chatHeight = height;
+        nativeFields(this.chat).mouseLayout = { width, children: chatChildren };
+      } finally {
+        if (this.rawCursor !== this.rawChildren.length) this.rawChanged = true;
+        this.observingRaw = false;
+      }
+      documentChildren.push({ component, height });
+    }
+    nativeFields(document).mouseLayout = { width, children: documentChildren };
+    if (!source) return head;
+
+    const cached = this.renderCache, after = head.length + source.length;
+    if (cached?.archive?.source === source && cached.archive.row === head.length &&
+        cached.marked.length === after + tail.length &&
+        head.every((line, i) => line === cached.marked[i]) && tail.every((line, i) => line === cached.marked[after + i])) {
+      return cached.marked;
+    }
+    return head.concat(source, tail);
+  }
 
   private archiveSpan(rendered: readonly string[]): { row: number; source: readonly string[] } | undefined {
     const archive = this.archiveCache?.component, source = archive?.collectedLines;
@@ -319,7 +383,7 @@ export class History {
   private collectLines(rendered: string[], width: number): string[] {
     const cached = this.renderCache, archive = this.archiveSpan(rendered), spans = this.nativeSpans(rendered, width);
     const sameArchive = archive && cached?.archive?.source === archive.source;
-    let from = 0, oldEnd = cached?.marked.length ?? 0, end = rendered.length;
+    let from = cached?.marked === rendered ? rendered.length : 0, oldEnd = cached?.marked.length ?? 0, end = rendered.length;
     if (cached) {
       const previous = cached.spans ?? [];
       let nextSpan = 0, oldSpan = 0;
