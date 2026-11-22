@@ -4,10 +4,11 @@ import { Container, type Component, type TuiMouseEvent } from "@earendil-works/p
 const CHUNK_SIZE = 64;
 const ASYNC_THRESHOLD = 512;
 const PREPARE_BUDGET_MS = 4;
+type RenderLines = ReturnType<Component["render"]>;
 
 /** Keep two recent widths per immutable block; an expansion only invalidates its own block. */
 class ArchivedChunk extends Container {
-  private widths = new Map<number, string[]>();
+  private widths = new Map<number, RenderLines>();
   private epoch: number;
   private hideThinkingBlock: boolean;
   constructor(private collecting: () => boolean, private changed: () => void, private currentEpoch: () => number, private currentHideThinkingBlock: () => boolean) {
@@ -16,7 +17,7 @@ class ArchivedChunk extends Container {
   has(width: number): boolean { return this.epoch === this.currentEpoch() && this.widths.has(width); }
   clearCache(): void { this.widths.clear(); this.changed(); }
   invalidate(): void { this.clearCache(); super.invalidate(); this.epoch = this.currentEpoch(); }
-  render(width: number): string[] {
+  render(width: number): RenderLines {
     if (this.epoch !== this.currentEpoch()) {
       this.epoch = this.currentEpoch();
       this.widths.clear();
@@ -76,7 +77,7 @@ export class ArchivedHistory extends Container {
   private disposed = false;
   constructor(
     private collecting: () => boolean,
-    private collect: (render: () => string[]) => string[],
+    private collect: (render: () => RenderLines) => RenderLines,
     private ready: () => void,
     private failed: (error: unknown) => void,
     private marker = "",
@@ -130,7 +131,7 @@ export class ArchivedHistory extends Container {
     chunk.removeChild(component); this.count--;
     if (!chunk.children.length) super.removeChild(chunk);
   }
-  render(width: number): string[] {
+  render(width: number): RenderLines {
     // Explicit legacy/full output must include views still awaiting background construction.
     if (!this.collecting()) {
       const work = this.construction;
@@ -149,7 +150,7 @@ export class ArchivedHistory extends Container {
       return this.cached?.lines ?? [];
     }
     this.cancelPreparation();
-    const lines = super.render(width);
+    const lines = [...super.render(width)];
     if (lines.length) lines[0] = this.marker + lines[0];
     this.cached = { width, revision: this.revision, lines };
     return lines;

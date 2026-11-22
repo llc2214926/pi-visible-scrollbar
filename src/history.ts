@@ -7,6 +7,7 @@ import { SessionBranch } from "./branch.ts";
 
 const ARCHIVE_FRAME_MIN_ROWS = 8192;
 type MouseChildren = { component: Component; height: number }[];
+type RenderLines = ReturnType<Component["render"]>;
 
 type Entry = host.SessionEntry;
 interface NativeFields {
@@ -18,10 +19,22 @@ interface NativeFields {
   messageId?: unknown;
   markdownTransformers?: unknown;
   mouseLayout?: { width: number; children: MouseChildren };
+  childLines?: { width: number; children: readonly Component[]; parts: readonly (readonly string[])[] };
 }
 function nativeFields(component: Component): NativeFields {
   // SAFETY: Only stock Container instances have their mouse layout published here.
   return component as unknown as NativeFields;
+}
+const mouseLayouts = new WeakMap<object, { width: number; children: MouseChildren }>();
+function mouseLayout(component: Component) {
+  const fields = nativeFields(component), layout = fields.childLines;
+  if (!layout) return fields.mouseLayout;
+  let cached = mouseLayouts.get(layout);
+  if (!cached) {
+    cached = { width: layout.width, children: layout.children.map((component, i) => ({ component, height: layout.parts[i].length })) };
+    mouseLayouts.set(layout, cached);
+  }
+  return cached;
 }
 interface Boundary { component: Component; slot: number; signature: string; prompt: boolean }
 interface RenderSpan { row: number; source: readonly string[]; run?: { from: number; end: number; first: number; next: number } }
@@ -30,8 +43,8 @@ interface NativeRender {
   wrapped: Component["render"];
   own: boolean;
   cacheable: boolean;
-  widths: Map<number, string[]>;
-  source?: string[];
+  widths: Map<number, RenderLines>;
+  source?: RenderLines;
   restore: (() => void)[];
 }
 interface ArchiveState {
@@ -189,7 +202,7 @@ export class History {
   private originalRender: Component["render"];
   private wrappedRender: Component["render"];
   private hadOwnRender: boolean;
-  private renderCache?: { width: number; marked: string[]; clean: string[]; archive?: { row: number; source: readonly string[] }; spans?: RenderSpan[]; spanOffset?: number };
+  private renderCache?: { width: number; marked: RenderLines; clean: string[]; archive?: { row: number; source: readonly string[] }; spans?: RenderSpan[]; spanOffset?: number };
   private anchorById = new Map<string, Anchor>();
   private frameCache?: Map<number, string[]>;
 
@@ -238,7 +251,7 @@ export class History {
       try { this.sync(); }
       catch (error) { return this.restoreOnError(error, width); }
       this.collecting = true;
-      let rendered: string[];
+      let rendered: RenderLines;
       try {
         const archive = this.readyArchiveForFrame();
         rendered = archive ? this.renderArchivedDocument(width, archive) : this.originalRender.call(document, width);
@@ -261,7 +274,7 @@ export class History {
     document.render = this.wrappedRender;
   }
 
-  private restoreOnError(error: unknown, width: number): string[] {
+  private restoreOnError(error: unknown, width: number): RenderLines {
     this.collecting = false;
     this.dispose();
     if (!this.onError) throw error;
@@ -274,6 +287,8 @@ export class History {
 
   private readyArchiveForFrame(): ArchivedHistory | undefined {
     const archive = this.archiveCache?.component;
+    // Pi 1.6.0 已缓存原生子布局；沿用宿主合成，避免写入已移除的 mouseLayout。
+    if ("childLines" in nativeFields(this.document)) return undefined;
     if (!this.frameCache || !archive || (archive.collectedLines?.length ?? 0) < ARCHIVE_FRAME_MIN_ROWS ||
         this.originalRender !== Container.prototype.render || this.originalChatRender !== Container.prototype.render ||
         this.document.constructor !== Container || this.chat.constructor !== Container ||
@@ -282,12 +297,12 @@ export class History {
     return archive;
   }
 
-  private renderArchivedDocument(width: number, archive: ArchivedHistory): string[] {
+  private renderArchivedDocument(width: number, archive: ArchivedHistory): RenderLines {
     const document = this.document as Container;
     // Like Container.render, call children in order and publish immediate-child hit heights.
     // Keep the immutable archive separate until we know whether the flat document changed.
     const head: string[] = [], tail: string[] = [], documentChildren: MouseChildren = [];
-    let source: string[] | undefined;
+    let source: readonly string[] | undefined;
     for (const component of document.children) {
       if (component !== this.chat || component.render !== this.wrappedChatRender || source) {
         const lines = component.render(width);
@@ -346,7 +361,7 @@ export class History {
     this.spanOffset = -1;
     if (this.originalRender !== Container.prototype.render || this.chat.render !== this.wrappedChatRender ||
         this.originalChatRender !== Container.prototype.render) return [];
-    const document = nativeFields(this.document).mouseLayout, chat = nativeFields(this.chat).mouseLayout;
+    const document = mouseLayout(this.document), chat = mouseLayout(this.chat);
     if (document?.width !== width || chat?.width !== width || !Array.isArray(document.children) || !Array.isArray(chat.children)) return [];
     let offset = 0;
     let foundChat = false;
@@ -380,7 +395,7 @@ export class History {
     return spans;
   }
 
-  private collectLines(rendered: string[], width: number): string[] {
+  private collectLines(rendered: RenderLines, width: number): string[] {
     const cached = this.renderCache, archive = this.archiveSpan(rendered), spans = this.nativeSpans(rendered, width);
     const sameArchive = archive && cached?.archive?.source === archive.source;
     let from = cached?.marked === rendered ? rendered.length : 0, oldEnd = cached?.marked.length ?? 0, end = rendered.length;
@@ -480,7 +495,7 @@ export class History {
     const original = component.render;
     const token = this.tokenSerial++;
     this.tokens.set(token, prompt);
-    let cached: { source: string[]; marked: string[] } | undefined;
+    let cached: { source: readonly string[]; marked: string[] } | undefined;
     const wrapped = (width: number) => {
       const lines = original.call(component, width);
       if (this.disposed || !this.collecting || this.bound.get(component)?.wrapped !== wrapped || !lines.length) return lines;
