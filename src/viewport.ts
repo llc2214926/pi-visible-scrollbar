@@ -1,4 +1,4 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { VERSION, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, ScrollView, compositeTuiLine, sliceByColumn, type Component, type ScrollViewScrollbar, type StackEntry, type TUI } from "@earendil-works/pi-tui";
 import { History } from "./history.ts";
 import { nearestAnchor, type Anchor, type Snapshot } from "./model.ts";
@@ -8,10 +8,10 @@ interface Rect { x: number; y: number; width: number; height: number }
 interface LayoutBox { component: Component; rect: Rect; clip: Rect; children: LayoutBox[]; parent?: LayoutBox; scrollView?: ScrollView; layer?: number }
 interface HostInternals {
   getMountedRoots?: () => readonly Component[];
-  requestImmediateRender?: () => void;
   routeWheel?: (pointer: { x: number; y: number }, delta: number) => void;
   doRender?: () => void;
   compositeScrollToEndIndicator?: (screen: string[], layout: { root: LayoutBox }, width: number) => string[];
+  resetTextSelection?: () => void;
 }
 interface StackInternals { entries?: StackEntry[]; children?: Component[] }
 function internals(component: Component): StackInternals {
@@ -26,6 +26,7 @@ function roots(tui: TUI): readonly Component[] {
 
 interface Mount { entry: StackEntry; scroll: ScrollView; document: Container; chat: Container }
 function findMount(tui: TUI): Mount {
+  if (VERSION !== "1.6.0") throw new Error("Visible scrollbar requires Pi 1.6.0; the native layout was left unchanged.");
   if (tui.mode !== "fullscreen") throw new Error("Visible scrollbar requires Pi fullscreen mode.");
   const candidates: Mount[] = [];
   const seen = new Set<Component>();
@@ -38,7 +39,7 @@ function findMount(tui: TUI): Mount {
       const child = entry.component;
       if (child instanceof ScrollView && child.primary) {
         const document = child.children[0];
-        // Pi 1.5.2's document is [header, loaded resources, chat]. Never guess another slot.
+        // Pi 1.6.0's document is [header, loaded resources, chat]. Never guess another slot.
         if (child.children.length !== 1 || document?.constructor !== Container ||
             (document as Container).children.length !== 3 || (document as Container).children[2]?.constructor !== Container) {
           throw new Error("Unsupported Pi transcript layout; the original scrollbar was left unchanged.");
@@ -63,27 +64,33 @@ export class Viewport {
   private wrappedUpdate: ScrollView["updateLayout"];
   private hadOwnUpdate: boolean;
   private originalScrollTo: ScrollView["scrollTo"];
+  private originalScrollToEnd: ScrollView["scrollToEnd"];
   private restoreNavigation: (() => void)[] = [];
   private previousAnchors: Anchor[] = [];
   private previousTop = -1;
-  private pendingId?: string;
+  private navigationVersion = 0;
+  private pendingPageTop = false;
+  private nativePosition?: { top: number; following: boolean; height: number; anchors: Anchor[] };
   private preparationBookmark?: { id: string; offset: number };
   private disposed = false;
 
-  constructor(readonly tui: TUI, ctx: ExtensionContext, getHideThinkingBlock: () => boolean = () => false) {
+  constructor(readonly tui: TUI, private ctx: ExtensionContext, getHideThinkingBlock: () => boolean = () => false, getOutputPad: () => number = () => 1) {
     this.mount = findMount(tui);
     const { scroll, document, chat } = this.mount;
     this.scrollbar = scroll.scrollbar;
     const host = tui.valueOf() as HostInternals;
     if (typeof host.doRender !== "function" || typeof host.compositeScrollToEndIndicator !== "function") {
-      throw new Error("Pi 1.5.2 transcript compositor is unavailable; the native layout was left unchanged.");
+      throw new Error("Pi 1.6.0 transcript compositor is unavailable; the native layout was left unchanged.");
     }
-    this.history = new History(document, chat, ctx, tui, error => this.disable(error), getHideThinkingBlock);
     this.originalScrollTo = scroll.scrollTo.bind(scroll);
-    // Native input is consumed before extension listeners; cancel at the shared navigation methods,
-    // including no-op Ctrl+End. Internal layout restoration uses the saved scrollTo instead.
+    this.originalScrollToEnd = scroll.scrollToEnd.bind(scroll);
+    this.history = new History(document, chat, ctx, tui, error => this.disable(error), getHideThinkingBlock,
+      mode => this.changeView(mode), () => scroll.scrollTop, getOutputPad);
+    // Native input is consumed before extension listeners. Cancel superseded jumps here,
+    // including no-op Ctrl+End; internal layout restoration uses the saved methods instead.
     const navigation = <Args extends unknown[], Result>(original: (...args: Args) => Result) => (...args: Args): Result => {
-      this.pendingId = undefined;
+      this.navigationVersion++;
+      this.history.cancelNavigation();
       this.preparationBookmark = undefined;
       return original.apply(scroll, args);
     };
@@ -91,7 +98,7 @@ export class Viewport {
       scrollTo: navigation(scroll.scrollTo),
       scrollBy: navigation(scroll.scrollBy),
       scrollToStart: navigation(scroll.scrollToStart),
-      scrollToEnd: navigation(scroll.scrollToEnd),
+      scrollToEnd: navigation(() => { this.history.closePage(); return this.originalScrollToEnd(); }),
     };
     for (const key of ["scrollTo", "scrollBy", "scrollToStart", "scrollToEnd"] as const) {
       const original = Object.getOwnPropertyDescriptor(scroll, key);
@@ -108,18 +115,16 @@ export class Viewport {
       const before = scroll.scrollTop;
       const following = scroll.isFollowingEnd;
       if (this.preparationBookmark && (before !== this.previousTop || following)) this.preparationBookmark = undefined;
-      if (this.history.isPending && !following && !this.pendingId && !this.preparationBookmark) {
+      if (this.history.isPending && !following && !this.pendingPageTop && !this.preparationBookmark) {
         const anchor = nearestAnchor(this.previousAnchors, before);
         if (anchor) this.preparationBookmark = { id: anchor.id, offset: before - anchor.row };
       }
       const previous = !following && before === this.previousTop && this.history.anchors !== this.previousAnchors
         ? nearestAnchor(this.previousAnchors, before) : undefined;
       this.originalUpdate.call(scroll, total, height, requestRender);
-      if (!this.history.isPending && this.pendingId && !this.history.hasPrompt(this.pendingId)) this.pendingId = undefined;
-      const target = !this.history.isPending && this.pendingId ? this.history.anchor(this.pendingId) : undefined;
-      if (target) {
-        this.originalScrollTo(target.row, { disableFollow: true });
-        this.pendingId = undefined;
+      if (this.pendingPageTop && this.history.inPage) {
+        this.originalScrollTo(this.history.pageOffset, { disableFollow: true });
+        this.pendingPageTop = false;
         this.preparationBookmark = undefined;
       } else if (this.preparationBookmark) {
         if (this.history.isPending) this.originalScrollTo(before, { disableFollow: true });
@@ -182,6 +187,29 @@ export class Viewport {
     scroll.setScrollbar("always");
   }
 
+  private changeView(mode: "page" | "live" | "end"): void {
+    const { scroll } = this.mount;
+    if (mode === "page") {
+      this.nativePosition ??= { top: scroll.scrollTop, following: scroll.isFollowingEnd, height: this.history.nativeHeight, anchors: this.previousAnchors };
+      this.pendingPageTop = true;
+      this.preparationBookmark = undefined; this.previousAnchors = [];
+      this.originalScrollTo(0, { disableFollow: true });
+    } else if (mode === "end") this.originalScrollToEnd();
+    else {
+      const position = this.nativePosition;
+      this.nativePosition = undefined; this.pendingPageTop = false; this.preparationBookmark = undefined;
+      if (position) {
+        // Restore against the last native extent, not the short page's clamped scroll range.
+        this.originalUpdate.call(scroll, this.history.nativeHeight || position.height, scroll.viewportHeight, () => this.tui.requestRender());
+        if (position.following) this.originalScrollToEnd();
+        else this.originalScrollTo(position.top, { disableFollow: true });
+        this.previousAnchors = position.anchors; this.previousTop = scroll.scrollTop;
+      }
+    }
+    const host = this.tui.valueOf() as HostInternals;
+    host.resetTextSelection?.();
+  }
+
   private disable(error: unknown): void {
     this.failure = error instanceof Error ? error.message : String(error);
     this.dispose();
@@ -228,40 +256,57 @@ export class Viewport {
     // Keep the native scrollbar visible and remember settings changes for cleanup.
     if (!this.disposed && scroll.scrollbar !== "always") { this.scrollbar = scroll.scrollbar; scroll.setScrollbar("always"); }
     return { anchors: this.history.anchors, lines: this.history.lines, width: this.history.width,
-      height: scroll.viewportHeight, top: scroll.scrollTop, contentHeight: this.history.lines.length, preparing: this.history.isPending,
+      height: scroll.viewportHeight, top: scroll.scrollTop, contentHeight: this.history.lines.length,
+      preparing: this.history.isFramePending,
       lineChange: this.history.lineChange };
   }
 
-  jump(id: string): boolean {
-    if (!this.mounted || !this.history.hasPrompt(id)) return false;
-    this.preparationBookmark = undefined;
-    this.pendingId = id;
-    const anchor = this.history.anchor(id);
-    if (anchor) {
-      this.originalScrollTo(anchor.row, { disableFollow: true });
-      if (!this.history.isPending) this.pendingId = undefined;
+  async jump(id: string): Promise<boolean> {
+    if (!this.mounted) return false;
+    const version = ++this.navigationVersion;
+    this.history.cancelNavigation(true); this.preparationBookmark = undefined;
+    try { await this.history.ready(); } catch { return false; }
+    if (!this.mounted || version !== this.navigationVersion) return false;
+    const anchor = this.history.anchor(id), start = this.history.currentPage?.start;
+    if (anchor && !(start?.id === id && start.line > 0)) {
+      this.originalScrollTo(anchor.row, { disableFollow: true }); return true;
     }
-    this.tui.requestRender();
-    return true;
+    return this.history.open(id);
   }
 
-  scrollTo(row: number, immediate = false): void {
-    const scroll = this.mount.scroll, before = scroll.scrollTop, following = scroll.isFollowingEnd;
-    scroll.scrollTo(row);
-    if (scroll.scrollTop === before && scroll.isFollowingEnd === following) return;
-    // Use Pi's keyboard-input fast path for dragging, without forcing a full-screen/image clear.
-    // SAFETY: Pi 1.5.2's optional fast path is checked before calling; other hosts use requestRender.
-    const host = this.tui as unknown as HostInternals;
-    if (immediate && typeof host.requestImmediateRender === "function") host.requestImmediateRender();
-    else this.tui.requestRender();
+  async step(direction: -1 | 1): Promise<boolean> {
+    if (!this.mounted) return false;
+    const version = ++this.navigationVersion;
+    this.history.cancelNavigation(true);
+    try {
+      await this.history.ready();
+      if (!this.mounted || version !== this.navigationVersion) return false;
+      if (!this.history.inPage && this.history.isPending) {
+        this.ctx.ui.notify?.("Input positions are loading in background; /scrollbar list is available.");
+        return false;
+      }
+      const snapshot = this.snapshot(), anchor = nearestAnchor(snapshot.anchors, snapshot.top), page = this.history.currentPage;
+      let rank: number;
+      if (anchor) {
+        rank = this.history.promptRank(anchor.id);
+        if (direction > 0 && anchor.row <= snapshot.top) rank++;
+        if (direction < 0 && anchor.row >= snapshot.top) rank--;
+      } else if (page?.current) rank = page.current.rank + (direction > 0 ? 1 : 0);
+      else return false;
+      const target = await this.history.prompt({ rank });
+      return target && this.mounted && version === this.navigationVersion ? this.jump(target.id) : false;
+    } catch { return false; }
   }
+
+  // ScrollView already requests Pi's view-only frame; do not invalidate unchanged native text.
+  scrollTo(row: number): void { this.mount.scroll.scrollTo(row); }
   scrollBy(delta: number, pointer?: { x: number; y: number }): void {
     const host = this.tui.valueOf() as HostInternals;
     if (pointer && typeof host.routeWheel === "function") host.routeWheel(pointer, delta);
-    else { this.mount.scroll.scrollBy(delta); this.tui.requestRender(); }
+    else this.mount.scroll.scrollBy(delta);
   }
-  end(): void { this.mount.scroll.scrollToEnd(); this.tui.requestRender(); }
-  refresh(): void { this.history.invalidate(); this.tui.requestRender(); }
+  end(): void { this.mount.scroll.scrollToEnd(); }
+  refresh(reset = false): void { if (reset) this.navigationVersion++; this.history.invalidate(reset); this.tui.requestRender(); }
 
   dispose(): void {
     if (this.disposed) return;
@@ -279,7 +324,7 @@ export class Viewport {
     }
     if (scroll.scrollbar === "always") scroll.setScrollbar(this.scrollbar);
     this.gutter = undefined;
-    this.previousAnchors = []; this.pendingId = undefined; this.preparationBookmark = undefined;
+    this.previousAnchors = []; this.nativePosition = undefined; this.pendingPageTop = false; this.preparationBookmark = undefined;
     this.tui.requestRender();
   }
 }

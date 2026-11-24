@@ -1,12 +1,12 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { copyToClipboard, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, configPath, loadConfig, saveConfig, type Config } from "./src/config.ts";
 import { Sidebar } from "./src/sidebar.ts";
 import { Viewport } from "./src/viewport.ts";
-import { anchorIndex } from "./src/model.ts";
+import { label } from "./src/model.ts";
+import { isHistoryCancelled } from "./src/history-client.ts";
 
 const WIDGET = "pi-visible-scrollbar.bootstrap";
-const USAGE = "/scrollbar on | off | status | list | prev | next | end | minimap on | minimap off";
+const USAGE = "/scrollbar on | off | status | list | prev | next | page prev | page next | find TEXT | copy FIRST-LAST | end | minimap on | minimap off";
 
 export default function visibleScrollbar(pi: ExtensionAPI): void {
   let config: Config = { ...DEFAULT_CONFIG };
@@ -35,7 +35,7 @@ export default function visibleScrollbar(pi: ExtensionAPI): void {
         let candidate: Viewport | undefined;
         try {
           if (!active) {
-            candidate = new Viewport(tui, ctx, () => pi.getSettings().hideThinkingBlock ?? false);
+            candidate = new Viewport(tui, ctx, () => pi.getSettings().hideThinkingBlock ?? false, () => pi.getSettings().outputPad ?? 1);
             const sidebar = new Sidebar(candidate, ctx, config.experimentalMinimap);
             active = { viewport: candidate, sidebar };
           }
@@ -73,24 +73,25 @@ export default function visibleScrollbar(pi: ExtensionAPI): void {
     dispose();
     if (ctx.mode === "tui") ctx.ui.setWidget(WIDGET, undefined);
   });
-  pi.on("session_tree", () => { active?.sidebar.closePopup(); active?.viewport.refresh(); });
+  pi.on("session_tree", () => { active?.sidebar.closePopup(); active?.viewport.refresh(true); });
   pi.on("session_compact", () => { active?.sidebar.closePopup(); active?.viewport.refresh(); });
   pi.on("message_end", () => { active?.viewport.refresh(); });
 
   pi.registerCommand("scrollbar", {
-    description: "User-input markers and scroll-only history navigation; optional experimental minimap",
-    getArgumentCompletions: prefix => ["on", "off", "status", "list", "prev", "next", "end", "minimap on", "minimap off"]
+    description: "Input markers, on-demand read-only history pages, background search/copy and an optional minimap",
+    getArgumentCompletions: prefix => ["on", "off", "status", "list", "prev", "next", "page prev", "page next", "find", "copy", "end", "minimap on", "minimap off"]
       .filter(value => value.startsWith(prefix)).map(value => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (ctx.mode !== "tui") { ctx.ui.notify("Visible scrollbar requires interactive fullscreen Pi.", "warning"); return; }
+      if (args.length > 2048) { ctx.ui.notify("History search is limited to 1024 characters.", "warning"); return; }
       const action = args.trim();
       if (action === "status") {
         const rendered = active?.viewport.history.anchors.length ?? 0;
-        const total = active?.viewport.history.prompts.length ?? 0;
+        const total = active?.viewport.history.promptCount ?? 0;
         const minimap = active?.sidebar.minimapStatus ?? (config.experimentalMinimap ? "on, not mounted" : "off");
-        const error = failure || active?.sidebar.minimapFailure;
-        const preparing = active?.viewport.history.isPending ? "; preparing history layout" : "";
-        ctx.ui.notify(`Visible scrollbar: ${config.enabled ? "on" : "off"}; ${active?.viewport.mounted ? "mounted" : "not mounted"}; inputs ${rendered}/${total}${preparing}; experimental minimap ${minimap}.\n${error || configPath()}`, error ? "warning" : "info");
+        const error = failure || active?.viewport.history.error || active?.sidebar.minimapFailure;
+        const history = active?.viewport.history.status ?? "not mounted";
+        ctx.ui.notify(`Visible scrollbar: ${config.enabled ? "on" : "off"}; ${active?.viewport.mounted ? "mounted" : "not mounted"}; visible inputs ${rendered}/${total}; ${history}; experimental minimap ${minimap}.\n${error || configPath()}`, error ? "warning" : "info");
         return;
       }
       if (["on", "off", "minimap on", "minimap off"].includes(action)) {
@@ -111,27 +112,36 @@ export default function visibleScrollbar(pi: ExtensionAPI): void {
         ctx.ui.notify(`Scrollbar ${config.enabled ? "on" : "off"}; experimental minimap ${config.experimentalMinimap ? "on" : "off"}.`);
         return;
       }
-      if (!["list", "prev", "next", "end"].includes(action)) { ctx.ui.notify(USAGE); return; }
+      const find = action === "find" || action.startsWith("find ");
+      const copy = /^copy\s+(\d+)(?:\s*-\s*(\d+))?$/.exec(action);
+      if (!["list", "prev", "next", "end", "page prev", "page next"].includes(action) && !find && !copy) { ctx.ui.notify(USAGE); return; }
       const controller = active;
       if (!controller?.viewport.mounted) { ctx.ui.notify(failure || "Use /scrollbar on in fullscreen mode first.", "warning"); return; }
       controller.sidebar.closePopup();
       const viewport = controller.viewport;
-      if (action === "end") { viewport.end(); return; }
-      viewport.tui.renderNow();
-      const snapshot = viewport.snapshot();
-      if (action === "list") {
-        const prompts = viewport.history.prompts.slice();
-        if (!prompts.length) { ctx.ui.notify("No user inputs in this branch."); return; }
-        const options = prompts.map((p, i) => `${i + 1}. ${truncateToWidth(p.label, 100)}`);
-        const selected = await ctx.ui.select("Jump to user input · display only", options);
-        if (selected && active === controller && viewport.mounted) {
-          const index = options.indexOf(selected);
-          if (index >= 0 && !viewport.jump(prompts[index].id)) ctx.ui.notify("That input is no longer in the current branch.", "warning");
+      try {
+        if (action === "end") { viewport.end(); return; }
+        if (find) { await viewport.history.find(action === "find" ? undefined : action.slice(5)); return; }
+        if (copy) {
+          const first = Number(copy[1]), last = Number(copy[2] ?? copy[1]);
+          if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last) || first < 1 || last < first) throw new Error("Use /scrollbar copy FIRST-LAST with positive input numbers");
+          const text = await viewport.history.copy(first - 1, last - 1);
+          if (active !== controller || !viewport.mounted) return;
+          await copyToClipboard(text);
+          ctx.ui.notify(`Copied inputs ${first}–${last} and their replies (plain text).`);
+          return;
         }
-      } else {
-        const index = anchorIndex(snapshot.anchors, snapshot.top + (action === "next" ? 1 : 0));
-        const target = snapshot.anchors[action === "next" ? index : index - 1];
-        if (target) viewport.jump(target.id);
+        if (action.startsWith("page ")) {
+          if (!viewport.history.inPage) ctx.ui.notify("Open an input with /scrollbar list first.");
+          else await viewport.history.turnPage(action === "page prev" ? -1 : 1);
+          return;
+        }
+        if (action === "list") {
+          const id = await viewport.history.choose();
+          if (id && active === controller && viewport.mounted && !await viewport.jump(id)) ctx.ui.notify("That input is no longer available.", "warning");
+        } else await viewport.step(action === "prev" ? -1 : 1);
+      } catch (error) {
+        if (!isHistoryCancelled(error) && active === controller) ctx.ui.notify(label(error instanceof Error ? error.message : String(error)).slice(0, 240), "warning");
       }
     },
   });

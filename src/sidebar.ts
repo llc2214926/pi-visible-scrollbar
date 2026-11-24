@@ -4,6 +4,7 @@ import { bucketRanges, type Anchor, type AnchorRange, type Snapshot } from "./mo
 import { Minimap, minimapGeometry } from "./minimap.ts";
 import { GraphicMinimap, minimapProtocol } from "./graphics.ts";
 import { Viewport } from "./viewport.ts";
+import { requestViewFrame } from "./native-history.ts";
 
 const DRAG_SCROLL_MS = 32;
 
@@ -27,7 +28,7 @@ export class Sidebar implements Component {
   constructor(private viewport: Viewport, private ctx: ExtensionContext, private experimentalMinimap: boolean) {
     this.map = new Minimap(() => {
       if (this.disposed || viewport.tui.hasOverlay()) return;
-      if (!this.graphics?.redraw(false)) viewport.tui.requestRender();
+      if (!this.graphics?.redraw(false)) requestViewFrame(viewport.tui);
     }, error => this.failMinimap(error));
     viewport.setGutter(this, 3);
     this.removeInput = viewport.tui.addInputListener(data => {
@@ -87,7 +88,7 @@ export class Sidebar implements Component {
       return;
     }
     const snapshot = this.viewport.snapshot();
-    this.viewport.scrollTo(Math.round(this.drag.position * Math.max(0, snapshot.contentHeight - snapshot.height)), true);
+    this.viewport.scrollTo(Math.round(this.drag.position * Math.max(0, snapshot.contentHeight - snapshot.height)));
   }
 
   private failMinimap(error: unknown): void {
@@ -151,7 +152,11 @@ export class Sidebar implements Component {
     const snapshot = this.rendered;
     if (!snapshot || !this.viewport.mounted) return undefined;
     // Pi can cancel capture on focus loss without delivering a release to this component.
-    if (event.type === "press") { this.cancelDrag(); this.suppressClick = false; }
+    if (event.type === "press") {
+      const wasDragging = !!this.drag;
+      this.cancelDrag(); this.suppressClick = false;
+      if (wasDragging) requestViewFrame(this.viewport.tui);
+    }
     if (event.type === "wheel") {
       if (this.drag?.kind === "map") { this.cancelDrag(); this.suppressClick = false; }
       this.closePopup(); this.viewport.scrollBy(event.wheelDelta ?? 0, { x: event.screenX, y: event.screenY });
@@ -185,12 +190,12 @@ export class Sidebar implements Component {
         // Keep continuous scroll coordinates so a same-cell move does not quantize the reading position.
         this.drag = { kind: "map", grab: event.y - mapGeometry.top, row: event.y, position: mapGeometry.max ? snapshot.top / mapGeometry.max : 0, moved: false };
         this.suppressClick = true;
-        if (!this.graphics?.redraw()) this.viewport.tui.requestRender();
+        if (!this.graphics?.redraw()) requestViewFrame(this.viewport.tui);
         return { capture: true, render: false };
       }
       // Pi owns the last column's thumb, capture and click semantics.
       if (onThumbLane) return undefined;
-      return { handled: true };
+      return { handled: true, render: false };
     }
     if (event.type === "drag" && this.drag) {
       const latest = this.viewport.snapshot();
@@ -203,18 +208,23 @@ export class Sidebar implements Component {
       if (event.y <= 0) this.drag.position = 0;
       else if (event.y >= latest.height - 1) this.drag.position = 1;
       this.drag.moved = true;
-      if (!this.graphics?.redraw()) this.viewport.tui.requestRender();
+      if (!this.graphics?.redraw()) requestViewFrame(this.viewport.tui);
       if (this.drag && !this.dragTimer) this.dragTimer = setTimeout(() => this.flushMapDrag(), DRAG_SCROLL_MS);
       return { capture: true, render: false };
     }
-    if (event.type === "release") { this.flushMapDrag(); this.cancelDrag(); return { handled: true }; }
+    if (event.type === "release") {
+      const wasDragging = !!this.drag;
+      this.flushMapDrag(); this.cancelDrag();
+      if (wasDragging) requestViewFrame(this.viewport.tui);
+      return { handled: true, render: false };
+    }
     if (event.type === "click" && event.button === "left") {
-      if (this.suppressClick) { this.suppressClick = false; return { handled: true }; }
+      if (this.suppressClick) { this.suppressClick = false; return { handled: true, render: false }; }
       if (onMap && mapGeometry) this.viewport.scrollTo(Math.round(mapGeometry.start + (event.y + 0.5) * mapGeometry.count / Math.max(1, snapshot.height) - snapshot.height / 2));
       else if (marker && count === 1) this.viewport.jump(snapshot.anchors[group.start].id);
       else if (marker && count > 1) this.openPopup(group, snapshot.anchors, event);
       else if (!onThumbLane) this.viewport.scrollTo(Math.floor(event.y * snapshot.contentHeight / Math.max(1, snapshot.height)));
-      return { handled: true };
+      return { handled: true, render: false };
     }
     return { handled: true, render: false };
   }

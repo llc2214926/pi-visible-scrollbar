@@ -1,60 +1,20 @@
-import { getCellDimensions, sliceByColumn, stripTerminalSequences, visibleWidth, type ImageProtocol } from "@earendil-works/pi-tui";
+import { getPackageDir } from "@earendil-works/pi-coding-agent";
+import { getCapabilities, getCellDimensions, type ImageProtocol } from "@earendil-works/pi-tui";
 import { Worker } from "node:worker_threads";
 import type { Snapshot } from "./model.ts";
 import { rasterPng, rasterPngAsync, rectanglePng, viewportPng, viewportPngAsync } from "./png.ts";
 
 const CONTENT_REFRESH_MS = 80;
-const PREPARE_SLICE_MS = 2;
-const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const SOURCE_CHARS = 16 * 1024;
+const MAX_SOURCE_ROWS = 8192;
+const MAX_SOURCE_CHARS = 4 * 1024 * 1024;
+const MAX_LINE_CHARS = 64 * 1024;
 function rasterSize(width: number, height: number): [number, number] {
   width = Math.max(8, Math.round(width)); height = Math.max(1, Math.round(height));
   const scale = Math.min(1, 1024 / width, 4096 / height);
   // Limit memory without independently squeezing one image axis.
   return [Math.max(8, Math.round(width * scale)), Math.max(1, Math.round(height * scale))];
 }
-const ANSI = ["#000000", "#cd3131", "#0dbc79", "#e5e510", "#2472c8", "#bc3fbc", "#11a8cd", "#e5e5e5", "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff"];
-function indexedColor(index: number): string {
-  if (index < 16) return ANSI[Math.max(0, index)];
-  if (index >= 232) { const gray = Math.min(255, 8 + (index - 232) * 10); return `rgb(${gray},${gray},${gray})`; }
-  const n = index - 16, levels = [0, 95, 135, 175, 215, 255];
-  return `rgb(${levels[Math.floor(n / 36) % 6]},${levels[Math.floor(n / 6) % 6]},${levels[n % 6]})`;
-}
-
-/** Keep actual text and SGR foreground colors; never replace characters with density dots. */
-export function coloredRuns(line: string, foreground: string): { text: string; color: string; column: number; cells: number }[] {
-  const runs: { text: string; color: string; column: number; cells: number }[] = [];
-  let column = 0, color = foreground, last = 0;
-  const add = (text: string) => {
-    text = stripTerminalSequences(text).replace(/[\x00-\x1f\x7f-\x9f]/g, "");
-    const cells = visibleWidth(text);
-    if (text) runs.push({ text, color, column, cells });
-    column += cells;
-  };
-  for (const match of line.matchAll(/\x1b\[([\d;]*)m/g)) {
-    add(line.slice(last, match.index));
-    const codes = (match[1] || "0").split(";").map(Number);
-    for (let i = 0; i < codes.length; i++) {
-      const code = codes[i];
-      if (code === 0 || code === 39) color = foreground;
-      else if (code >= 30 && code <= 37) color = ANSI[code - 30];
-      else if (code >= 90 && code <= 97) color = ANSI[code - 90 + 8];
-      else if (code === 38 || code === 48) {
-        const foregroundCode = code === 38;
-        if (codes[i + 1] === 2 && codes.length > i + 4) {
-          if (foregroundCode) color = `rgb(${codes.slice(i + 2, i + 5).map(n => Math.max(0, Math.min(255, n))).join(",")})`;
-          i += 4;
-        } else if (codes[i + 1] === 5 && codes.length > i + 2) {
-          if (foregroundCode) color = indexedColor(Math.max(0, Math.min(255, codes[i + 2])));
-          i += 2;
-        }
-      }
-    }
-    last = match.index! + match[0].length;
-  }
-  add(line.slice(last));
-  return runs;
-}
-
 export interface MiniGeometry {
   start: number;
   count: number;
@@ -128,8 +88,13 @@ interface Request {
   view: { offset: number; height: number; top: number; bottom: number };
 }
 function sameRequest(a: Request, b?: Request): boolean {
-  return !!b && a.key === b.key && a.offset === b.offset && a.height === b.height && a.lines.length === b.lines.length &&
-    a.lines.every((line, i) => line === b.lines[i] && a.sourceRows[i] === b.sourceRows[i]);
+  if (!b || a.key !== b.key || a.offset !== b.offset || a.height !== b.height || a.lines.length !== b.lines.length) return false;
+  let compared = 0;
+  for (let i = 0; i < a.lines.length; i++) {
+    compared += a.lines[i].length;
+    if (compared > 128 * 1024 || a.lines[i] !== b.lines[i] || a.sourceRows[i] !== b.sourceRows[i]) return false;
+  }
+  return true;
 }
 
 function unchangedWindow(snapshot: Snapshot, previous: readonly string[] | undefined, start: number, end: number): boolean {
@@ -144,8 +109,7 @@ export class Minimap {
   private timer?: ReturnType<typeof setTimeout>;
   private requested?: Request;
   private pending?: Request;
-  private preparing = false;
-  private running?: { request: Request; id: number; epoch: number };
+  private running?: { request: Request; id: number; epoch: number; row: number; offset: number; uploading: boolean; waiting: boolean; timer?: ReturnType<typeof setTimeout> };
   private epoch = 0;
   private serial = 0;
   private nextRenderAt = 0;
@@ -159,13 +123,12 @@ export class Minimap {
   private sourceLines?: readonly string[];
   private completed?: Request;
   private displayed?: MiniFrame;
-  private prepared = new Map<string, { column: number; color: string; glyphs: string[] }[]>();
   private failure?: Error;
   private solidBackground?: { key: string; png: Buffer };
   geometry?: MiniGeometry;
 
   constructor(private ready: () => void = () => {}, private failed: (error: unknown) => void = () => {}) {}
-  get isPending(): boolean { return !!(this.preparing || this.running || this.pending || this.timer); }
+  get isPending(): boolean { return !!(this.running || this.pending || this.timer); }
 
   render(snapshot: Snapshot, width: number, height: number, dark: boolean, dragging = false, position?: DragPosition): Buffer | undefined {
     const frame = this.frame(snapshot, width, height, dark, position);
@@ -257,9 +220,17 @@ export class Minimap {
       const reuse = previous?.key === key && previous.offset === offset && previous.height === cacheHeight &&
         previous.sourceRows[0] === first && previous.sourceRows.length === end - first && unchangedWindow(snapshot, this.sourceLines, first, end);
       if (!reuse) {
+        if (end - first > MAX_SOURCE_ROWS) throw new Error("Minimap preview is too tall; reduce the terminal size");
         const sourceRows = Array.from({ length: Math.max(0, end - first) }, (_, i) => first + i);
+        let chars = 0;
+        const lines = sourceRows.map(row => {
+          const line = snapshot.lines[row] ?? "";
+          chars += line.length;
+          if (line.length > MAX_LINE_CHARS || chars > MAX_SOURCE_CHARS) throw new Error("Minimap preview text exceeds its safe size limit");
+          return line;
+        });
         const request: Request = {
-          key, lines: sourceRows.map(row => snapshot.lines[row] ?? ""), sourceRows, width, height: cacheHeight, offset,
+          key, lines, sourceRows, width, height: cacheHeight, offset,
           columns: snapshot.width, geometry: { ...geometry, start: offset / geometry.lineHeight }, dark, layers,
           view: { offset: viewOffset - offset, height, ...rectangle },
         };
@@ -277,95 +248,97 @@ export class Minimap {
   }
 
   private schedule(): void {
-    if (!this.pending || this.preparing || this.running || this.timer) return;
+    if (!this.pending || this.running || this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      void this.start().catch(error => this.fail(error));
+      try { this.start(); } catch (error) { this.fail(error); }
     }, Math.max(0, this.nextRenderAt - performance.now()));
   }
 
-  private async start(): Promise<void> {
+  private start(): void {
     const request = this.pending, epoch = this.epoch;
     if (!request) return;
-    this.preparing = true;
-    try {
-      if (!this.worker) {
-        const worker = new Worker(new URL("./minimap-worker.mjs", import.meta.url), {
-          // The plain ESM raster stage needs no host/test flags; many process flags are invalid in workers.
-          execArgv: [],
-        });
-        this.worker = worker;
-        worker.on("message", async (message: { id: number; pixels?: Uint8Array; error?: string }) => {
-          if (this.worker !== worker || this.running?.id !== message.id) return;
-          const job = this.running, request = job.request, view = request.view;
-          let pixels: Uint8Array | undefined, png: Buffer | undefined;
-          try {
-            if (job.epoch === this.epoch) {
-              if (message.error || !message.pixels || message.pixels.byteLength !== request.width * request.height * 4) {
-                throw new Error(message.error || "Invalid minimap raster");
-              }
-              pixels = message.pixels;
-              // Keep this latest-only job active until compression finishes off the interactive thread.
-              png = request.layers ? await rasterPngAsync(pixels, request.width, request.height)
-                : await viewportPngAsync(pixels.subarray(view.offset * request.width * 4, (view.offset + view.height) * request.width * 4),
-                  request.width, view.height, view.top, view.bottom, request.dark, false);
-            }
-          } catch (error) {
-            if (this.worker === worker && this.running === job) {
-              this.running = undefined; worker.unref();
-              if (job.epoch === this.epoch) this.fail(error);
-              else this.schedule();
-            }
-            return;
+    if (!this.worker) {
+      const worker = new Worker(new URL("./minimap-worker.mjs", import.meta.url), {
+        execArgv: [], stdout: true, stderr: true,
+        workerData: { agentDir: getPackageDir(), capabilities: getCapabilities(), maxRows: MAX_SOURCE_ROWS, maxChars: MAX_SOURCE_CHARS, maxLine: MAX_LINE_CHARS },
+        resourceLimits: { maxOldGenerationSizeMb: 256, maxYoungGenerationSizeMb: 16 },
+      });
+      this.worker = worker;
+      // Do not read/ref-count captured stdio; an idle worker must not keep Pi alive.
+      worker.on("message", async (message: { id: number; type?: string; pixels?: Uint8Array; error?: string }) => {
+        if (this.worker !== worker || this.running?.id !== message.id) return;
+        const job = this.running, request = job.request, view = request.view;
+        if (message.type === "credit") {
+          if (job.uploading && job.waiting) {
+            job.waiting = false;
+            job.timer = setTimeout(() => {
+              job.timer = undefined;
+              try { this.sendRows(job); } catch (error) { this.fail(error); }
+            }, 0);
           }
-          if (this.worker !== worker || this.running !== job) return;
-          this.running = undefined;
-          worker.unref();
-          if (job.epoch === this.epoch && pixels && png) {
-            this.pixels = pixels;
-            this.completed = request;
-            const version = ++this.rasterVersion;
-            this.encoded = request.layers ? { version, background: png }
-              : { version, composite: { key: imageKey({ ...view, version }, request.dark, false), png } };
-            this.ready();
+          return;
+        }
+        let pixels: Uint8Array | undefined, png: Buffer | undefined;
+        try {
+          if (job.epoch === this.epoch) {
+            if (message.error || !message.pixels || message.pixels.byteLength !== request.width * request.height * 4) {
+              throw new Error(message.error || "Invalid minimap raster");
+            }
+            pixels = message.pixels;
+            // Keep this latest-only job active until compression finishes off the interactive thread.
+            png = request.layers ? await rasterPngAsync(pixels, request.width, request.height)
+              : await viewportPngAsync(pixels.subarray(view.offset * request.width * 4, (view.offset + view.height) * request.width * 4),
+                request.width, view.height, view.top, view.bottom, request.dark, false);
           }
-          this.schedule();
-        });
-        worker.on("error", error => { if (this.worker === worker) this.fail(error); });
-        worker.on("exit", () => { if (this.worker === worker) this.fail(new Error("Minimap worker exited unexpectedly")); });
+        } catch (error) {
+          if (this.worker === worker && this.running === job) {
+            this.running = undefined; worker.unref();
+            if (job.epoch === this.epoch) this.fail(error);
+            else this.schedule();
+          }
+          return;
+        }
+        if (this.worker !== worker || this.running !== job) return;
+        this.running = undefined;
         worker.unref();
-      }
-      const foreground = request.dark ? "#d4d4d4" : "#333333";
-      const widths = new Map<string, number>(), rows: { column: number; color: string; glyphs: string[] }[][] = [];
-      let yieldAt = performance.now() + PREPARE_SLICE_MS;
-      for (const line of request.lines) {
-        const key = `${request.columns}:${foreground}:${line}`;
-        let runs = this.prepared.get(key);
-        if (!runs) {
-          runs = coloredRuns(sliceByColumn(line, 0, request.columns, true), foreground).map(run => ({
-            column: run.column, color: run.color, glyphs: Array.from(segmenter.segment(run.text), part => part.segment),
-          }));
-          this.prepared.set(key, runs);
+        if (job.epoch === this.epoch && pixels && png) {
+          this.pixels = pixels;
+          this.completed = request;
+          const version = ++this.rasterVersion;
+          this.encoded = request.layers ? { version, background: png }
+            : { version, composite: { key: imageKey({ ...view, version }, request.dark, false), png } };
+          try { this.ready(); } catch (error) { this.fail(error); }
         }
-        for (const run of runs) for (const glyph of run.glyphs) if (!widths.has(glyph)) widths.set(glyph, visibleWidth(glyph));
-        rows.push(runs);
-        while (this.prepared.size > 512) this.prepared.delete(this.prepared.keys().next().value!);
-        // Glyph preparation is main-thread work too; let pointer input run between short batches.
-        if (performance.now() >= yieldAt) {
-          await new Promise<void>(resolve => setImmediate(resolve));
-          if (epoch !== this.epoch || this.pending !== request) return;
-          yieldAt = performance.now() + PREPARE_SLICE_MS;
-        }
-      }
-      this.pending = undefined;
-      this.running = { request, id: ++this.serial, epoch };
-      this.nextRenderAt = performance.now() + CONTENT_REFRESH_MS;
-      this.worker.ref();
-      this.worker.postMessage({ id: this.serial, frame: { ...request, lines: undefined, rows, widths } });
-    } finally {
-      this.preparing = false;
-      this.schedule();
+        this.schedule();
+      });
+      worker.on("error", error => { if (this.worker === worker) this.fail(error); });
+      worker.on("exit", () => { if (this.worker === worker) this.fail(new Error("Minimap worker exited unexpectedly")); });
+      worker.unref();
     }
+    this.pending = undefined;
+    this.running = { request, id: ++this.serial, epoch, row: 0, offset: 0, uploading: true, waiting: true };
+    this.nextRenderAt = performance.now() + CONTENT_REFRESH_MS;
+    this.worker.ref();
+    this.worker.postMessage({ type: "start", id: this.serial, frame: { ...request, lines: undefined } });
+  }
+
+  private sendRows(job: NonNullable<Minimap["running"]>): void {
+    if (this.running !== job || !this.worker) return;
+    if (job.epoch !== this.epoch || (this.pending && this.pending !== job.request)) {
+      this.worker.postMessage({ type: "cancel", id: job.id });
+      this.running = undefined; this.worker.unref(); this.schedule(); return;
+    }
+    let text = "";
+    const ends: number[] = [], lines = job.request.lines;
+    while (job.row < lines.length && text.length < SOURCE_CHARS && ends.length < 128) {
+      const line = lines[job.row], count = Math.min(SOURCE_CHARS - text.length, line.length - job.offset);
+      text += line.slice(job.offset, job.offset + count); job.offset += count;
+      if (job.offset === line.length) { ends.push(text.length); job.row++; job.offset = 0; }
+    }
+    const done = job.row === lines.length;
+    job.waiting = job.uploading = !done;
+    this.worker.postMessage({ type: "rows", id: job.id, text, ends, done });
   }
 
   private fail(error: unknown): void {
@@ -398,9 +371,8 @@ export class Minimap {
     this.clear();
     const worker = this.worker;
     this.worker = undefined;
-    this.running = undefined;
+    clearTimeout(this.running?.timer); this.running = undefined;
     this.nextRenderAt = 0;
-    this.prepared.clear();
-    void worker?.terminate();
+    void worker?.terminate().catch(() => {});
   }
 }
