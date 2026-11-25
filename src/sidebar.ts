@@ -198,6 +198,13 @@ export class Sidebar implements Component {
       return { handled: true, render: false };
     }
     if (event.type === "drag" && this.drag) {
+      // Focus loss can end Pi's capture without a release; never revive that gesture from motion.
+      const capture = (this.viewport.tui.valueOf() as { mouseCapture?: { component: Component } }).mouseCapture;
+      if (capture?.component !== this || event.button !== "left" || this.viewport.tui.hasOverlay()) {
+        this.cancelDrag(); this.suppressClick = false;
+        requestViewFrame(this.viewport.tui);
+        return undefined;
+      }
       const latest = this.viewport.snapshot();
       // Repeated cell reports are not movement, even in the top/bottom endpoint cells.
       if (event.y === this.drag.row) return { capture: true, render: false };

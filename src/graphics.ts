@@ -24,6 +24,11 @@ export function minimapProtocol(tui: TUI): ImageProtocol {
   if (process.env.TMUX !== undefined || process.env.ZELLIJ !== undefined || process.env.STY !== undefined || /^(tmux|screen)/i.test(process.env.TERM ?? "")) return null;
   // Fullscreen Pi disables generic iTerm images after saving its negotiated imageProtocol.
   const protocol = renderer(tui).imageProtocol ?? getCapabilities().images;
+  // iTerm2 3.6+ Kitty placements avoid the terminal's draggable inline-file images.
+  if (protocol === "iterm2" && process.env.TERM_PROGRAM === "iTerm.app") {
+    const version = /^(\d+)\.(\d+)(?:\.|$)/.exec(process.env.TERM_PROGRAM_VERSION ?? "");
+    if (version && (Number(version[1]) > 3 || (Number(version[1]) === 3 && Number(version[2]) >= 6))) return "kitty";
+  }
   return protocol === "kitty" || protocol === "iterm2" ? protocol : null;
 }
 
