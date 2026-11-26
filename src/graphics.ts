@@ -20,6 +20,11 @@ function renderer(tui: TUI): Renderer {
   return tui.valueOf() as Renderer;
 }
 
+function iTermKittyDimensionsReversed(): boolean {
+  if (process.env.TERM_PROGRAM !== "iTerm.app") return false;
+  const version = /^(\d+)\.(\d+)\.(\d+)(?:\.|$)/.exec(process.env.TERM_PROGRAM_VERSION ?? "");
+  return version !== null && Number(version[1]) === 3 && Number(version[2]) === 6 && Number(version[3]) < 5;
+}
 export function minimapProtocol(tui: TUI): ImageProtocol {
   if (process.env.TMUX !== undefined || process.env.ZELLIJ !== undefined || process.env.STY !== undefined || /^(tmux|screen)/i.test(process.env.TERM ?? "")) return null;
   // Fullscreen Pi disables generic iTerm images after saving its negotiated imageProtocol.
@@ -144,7 +149,7 @@ export class GraphicMinimap {
     const { x, y, width, height } = box;
     const position = `${x}:${y}:${width}:${height}`;
     if (image.protocol === "kitty") {
-      this.kitty ??= new KittyLayers();
+      this.kitty ??= new KittyLayers(iTermKittyDimensionsReversed());
       const sequence = this.kitty.draw(image.layers, box, cells, preserved, cleared);
       this.painted = true;
       this.lastImage = undefined;

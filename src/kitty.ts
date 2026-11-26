@@ -12,7 +12,7 @@ export class KittyLayers {
   private uploaded = false;
   private failures = new Set<number>();
 
-  constructor() {
+  constructor(private transposeDimensions = false) {
     const id = allocateImageId();
     this.viewportId = id === this.backgroundId ? (id === 0xffffffff ? 1 : id + 1) : id;
   }
@@ -26,6 +26,8 @@ export class KittyLayers {
       : Math.round(layers.viewport.readUInt32BE(20) * box.width * cells.widthPx / layers.viewport.readUInt32BE(16));
     const pixelTop = Math.max(0, Math.min(box.height * cells.heightPx - viewportHeight, Math.round(layers.top * box.height * cells.heightPx)));
     const row = box.y + Math.floor(pixelTop / cells.heightPx), offset = pixelTop % cells.heightPx;
+    const columns = this.transposeDimensions ? box.height : box.width;
+    const rows = this.transposeDimensions ? box.width : box.height;
     const backgroundPosition = `${position}:${layers.backgroundTop}:${layers.backgroundHeight}`;
     const viewportPosition = `${position}:${pixelTop}:${layers.fullHeight}`;
     let output = "";
@@ -37,12 +39,13 @@ export class KittyLayers {
     if (backgroundChanged) upload(this.backgroundId, layers.background);
     if (viewportChanged) upload(this.viewportId, layers.viewport);
     if (backgroundChanged || !preserved || backgroundPosition !== this.backgroundPosition) {
-      output += `\x1b[${box.y + 1};${box.x + 1}H\x1b_Ga=p,i=${this.backgroundId},p=1,C=1,q=0,c=${box.width},r=${box.height},y=${layers.backgroundTop},h=${layers.backgroundHeight},z=0\x1b\\`;
+      output += `\x1b[${box.y + 1};${box.x + 1}H\x1b_Ga=p,i=${this.backgroundId},p=1,C=1,q=0,c=${columns},r=${rows},y=${layers.backgroundTop},h=${layers.backgroundHeight},z=0\x1b\\`;
     }
     if (backgroundChanged || viewportChanged || !preserved || viewportPosition !== this.viewportPosition) {
-      // Only specifying columns preserves fractional-row image height; Y is an in-cell pixel offset.
-      const rows = layers.fullHeight ? `,r=${box.height}` : "";
-      output += `\x1b[${row + 1};${box.x + 1}H\x1b_Ga=p,i=${this.viewportId},p=1,C=1,q=0,c=${box.width}${rows},Y=${offset},z=1\x1b\\`;
+      // iTerm2 3.6.0–3.6.4 swapped Kitty's c/r fields; specify only columns for a fractional-height frame.
+      const axis = this.transposeDimensions ? "r" : "c";
+      const size = layers.fullHeight ? `,c=${columns},r=${rows}` : `,${axis}=${box.width}`;
+      output += `\x1b[${row + 1};${box.x + 1}H\x1b_Ga=p,i=${this.viewportId},p=1,C=1,q=0${size},Y=${offset},z=1\x1b\\`;
     }
     this.background = layers.background;
     this.viewport = layers.viewport;
