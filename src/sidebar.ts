@@ -52,6 +52,11 @@ export class Sidebar implements Component {
           const drag = this.drag?.kind === "map" ? this.drag : undefined;
           const position = drag ? { top: drag.position * minimapGeometry(snapshot, width, height).travel / Math.max(1, snapshot.height), preview } : undefined;
           if (protocol === "kitty") {
+            // iTerm2 replaces overlapping Kitty images instead of alpha-compositing them.
+            if (process.env.TERM_PROGRAM === "iTerm.app") {
+              const png = this.map.render(snapshot, width, height, dark, !!drag, position);
+              return png ? { protocol, png } : undefined;
+            }
             const layers = this.map.renderLayers(snapshot, width, height, dark, !!drag, position);
             return layers ? { protocol, layers } : undefined;
           }

@@ -2,7 +2,7 @@ import { encodeITerm2, getCapabilities, getCellDimensions, sliceByColumn, visibl
 import { KittyLayers } from "./kitty.ts";
 import type { MinimapLayers } from "./minimap.ts";
 
-type GraphicImage = { protocol: "iterm2"; png: Buffer } | { protocol: "kitty"; layers: MinimapLayers };
+type GraphicImage = { protocol: "iterm2"; png: Buffer } | { protocol: "kitty"; layers: MinimapLayers } | { protocol: "kitty"; png: Buffer };
 
 const BEGIN = "\x1b[?2026h", END = "\x1b[?2026l", SAVE = "\x1b7", RESTORE = "\x1b8";
 const isImageLine = (line: string) => line.includes("\x1b_G") || line.includes("\x1b]1337;File=");
@@ -150,7 +150,9 @@ export class GraphicMinimap {
     const position = `${x}:${y}:${width}:${height}`;
     if (image.protocol === "kitty") {
       this.kitty ??= new KittyLayers(iTermKittyDimensionsReversed());
-      const sequence = this.kitty.draw(image.layers, box, cells, preserved, cleared);
+      const sequence = "layers" in image
+        ? this.kitty.draw(image.layers, box, cells, preserved, cleared)
+        : this.kitty.drawComposite(image.png, box, cells, preserved, cleared);
       this.painted = true;
       this.lastImage = undefined;
       this.lastBox = position;

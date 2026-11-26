@@ -9,6 +9,8 @@ export class KittyLayers {
   private viewport?: Buffer;
   private backgroundPosition = "";
   private viewportPosition = "";
+  private composite?: Buffer;
+  private compositePosition = "";
   private uploaded = false;
   private failures = new Set<number>();
 
@@ -19,6 +21,8 @@ export class KittyLayers {
 
   draw(layers: MinimapLayers, box: { x: number; y: number; width: number; height: number }, cells: CellDimensions, preserved: boolean, cleared: boolean): string {
     if (cleared) this.forget();
+    this.composite = undefined;
+    this.compositePosition = "";
     const backgroundChanged = this.background !== layers.background;
     const viewportChanged = this.viewport !== layers.viewport;
     const position = `${box.x}:${box.y}:${box.width}:${box.height}:${cells.widthPx}:${cells.heightPx}`;
@@ -56,6 +60,22 @@ export class KittyLayers {
     return output;
   }
 
+  drawComposite(png: Buffer, box: { x: number; y: number; width: number; height: number }, cells: CellDimensions, preserved: boolean, cleared: boolean): string {
+    if (cleared) this.forget();
+    const position = `${box.x}:${box.y}:${box.width}:${box.height}:${cells.widthPx}:${cells.heightPx}`;
+    if (preserved && this.composite === png && this.compositePosition === position) return "";
+    const columns = this.transposeDimensions ? box.height : box.width;
+    const rows = this.transposeDimensions ? box.width : box.height;
+    const remove = this.uploaded ? deleteKittyImage(this.backgroundId) + deleteKittyImage(this.viewportId) : "";
+    const image = encodeKitty(png.toString("base64"), { imageId: this.backgroundId, columns, rows, moveCursor: false });
+    this.background = this.viewport = undefined;
+    this.backgroundPosition = this.viewportPosition = "";
+    this.composite = png;
+    this.compositePosition = position;
+    this.uploaded = true;
+    return `${remove}\x1b[${box.y + 1};${box.x + 1}H${image}`;
+  }
+
   response(data: string): { retry?: boolean; error?: string } | undefined {
     const reply = /^\x1b_G([^;]+);([^\x1b]*)\x1b\\$/.exec(data);
     const id = reply && Number(/(?:^|,)i=(\d+)(?:,|$)/.exec(reply[1])?.[1]);
@@ -70,6 +90,8 @@ export class KittyLayers {
   private forget(): void {
     this.background = this.viewport = undefined;
     this.backgroundPosition = this.viewportPosition = "";
+    this.composite = undefined;
+    this.compositePosition = "";
   }
   clear(): string {
     const output = this.uploaded ? deleteKittyImage(this.backgroundId) + deleteKittyImage(this.viewportId) : "";
