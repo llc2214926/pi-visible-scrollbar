@@ -1,6 +1,7 @@
 import { VERSION, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, ScrollView, compositeTuiLine, sliceByColumn, type Component, type ScrollViewScrollbar, type StackEntry, type TUI } from "@earendil-works/pi-tui";
 import { History } from "./history.ts";
+import { isSupportedPiVersion } from "./compat.mjs";
 import { nearestAnchor, type Anchor, type Snapshot } from "./model.ts";
 
 const MINIMAP_RATIO = 0.06;
@@ -26,7 +27,7 @@ function roots(tui: TUI): readonly Component[] {
 
 interface Mount { entry: StackEntry; scroll: ScrollView; document: Container; chat: Container }
 function findMount(tui: TUI): Mount {
-  if (VERSION !== "1.6.0") throw new Error("Visible scrollbar requires Pi 1.6.0; the native layout was left unchanged.");
+  if (!isSupportedPiVersion(VERSION)) throw new Error("Visible scrollbar requires Pi >=1.6.0; the native layout was left unchanged.");
   if (tui.mode !== "fullscreen") throw new Error("Visible scrollbar requires Pi fullscreen mode.");
   const candidates: Mount[] = [];
   const seen = new Set<Component>();
@@ -80,7 +81,7 @@ export class Viewport {
     this.scrollbar = scroll.scrollbar;
     const host = tui.valueOf() as HostInternals;
     if (typeof host.doRender !== "function" || typeof host.compositeScrollToEndIndicator !== "function") {
-      throw new Error("Pi 1.6.0 transcript compositor is unavailable; the native layout was left unchanged.");
+      throw new Error("Pi transcript compositor is unavailable; the native layout was left unchanged.");
     }
     this.originalScrollTo = scroll.scrollTo.bind(scroll);
     this.originalScrollToEnd = scroll.scrollToEnd.bind(scroll);

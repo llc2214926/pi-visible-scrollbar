@@ -1,6 +1,7 @@
 import { getPackageDir, VERSION, type ExtensionContext, type SessionEntry, type Theme, type ThemeBg, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, getKeybindings } from "@earendil-works/pi-tui";
 import { Worker } from "node:worker_threads";
+import { isSupportedPiVersion } from "./compat.mjs";
 import {
   HISTORY_COPY_BYTES, HISTORY_PACKET_BYTES, HISTORY_PAGE_ROWS, HISTORY_SOURCE_CHARS,
   type HistoryLayout, type HistoryReplies, type HistoryRequestKind, type HistoryRequests, type HistoryTheme,
@@ -176,7 +177,7 @@ export class HistoryClient {
     this.launch = undefined;
     if (this.disposed || this.worker || !this.jobs.size) return;
     try {
-      if (VERSION !== "1.6.0") throw new Error("Paged history requires Pi 1.6.0");
+      if (!isSupportedPiVersion(VERSION)) throw new Error("Paged history requires Pi >=1.6.0");
       const worker = new Worker(new URL("./history-worker.mjs", import.meta.url), {
         execArgv: [], stdout: true, stderr: true,
         workerData: { agentDir: getPackageDir(), version: VERSION, cwd: this.cwd, pageRows: HISTORY_PAGE_ROWS, packetBytes: HISTORY_PACKET_BYTES, copyBytes: HISTORY_COPY_BYTES },

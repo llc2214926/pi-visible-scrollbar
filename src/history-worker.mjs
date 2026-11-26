@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { setImmediate as yieldTurn } from "node:timers/promises";
+import { isSupportedPiVersion } from "./compat.mjs";
 
 const require = createRequire(join(workerData.agentDir, "package.json"));
 const agentURL = pathToFileURL(join(workerData.agentDir, "dist/index.js")).href;
@@ -13,7 +14,7 @@ const [host, tui, themes] = await Promise.all([
   import(agentURL), import(tuiURL),
   import(new URL("./modes/interactive/theme/theme.js", agentURL)),
 ]);
-if (host.VERSION !== workerData.version || workerData.version !== "1.6.0") throw new Error("History renderer version does not match Pi 1.6.0");
+if (host.VERSION !== workerData.version || !isSupportedPiVersion(workerData.version)) throw new Error("History renderer requires Pi >=1.6.0 and must match the host version");
 const PAGE_ROWS = workerData.pageRows, PACKET_BYTES = workerData.packetBytes, COPY_BYTES = workerData.copyBytes;
 const CACHE_BYTES = 64 * 1024 * 1024, ENTRY_BYTES = 64 * 1024 * 1024;
 const queue = new Map(), sources = new Map(), credits = new Map();
@@ -339,6 +340,10 @@ async function unit(meta, layout, job) {
         const view = new host.CustomMessageComponent(message); view.setExpanded(layout.expanded); view.setOutputPad?.(layout.outputPad); group.addChild(view);
       } else if (message.role === "bashExecution") {
         group.addChild(new tui.Text(tui.stripTerminalSequences(`$ ${message.command}\n${message.output}`), 1, 1));
+        if (typeof message.fullOutputError === "string" && message.fullOutputError.trim()) {
+          const warning = tui.stripTerminalSequences(`Could not save the full output: ${message.fullOutputError}`).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+          group.addChild(new tui.Text(themes.theme.fg("warning", warning), 1, 0));
+        }
       } else if (message.role === "compactionSummary" || message.role === "branchSummary") {
         const view = message.role === "compactionSummary" ? new host.CompactionSummaryMessageComponent(message) : new host.BranchSummaryMessageComponent(message);
         view.setExpanded(layout.expanded); group.addChild(view);
