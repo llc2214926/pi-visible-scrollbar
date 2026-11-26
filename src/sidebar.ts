@@ -138,19 +138,15 @@ export class Sidebar implements Component {
       this.tracks = bucketRanges(snapshot.anchors, snapshot.contentHeight, snapshot.height);
     }
     this.rendered = snapshot;
-    const miniWidth = Math.max(0, width - 3);
-    const cells = getCellDimensions();
-    const mapGeometry = miniWidth ? minimapGeometry(snapshot, miniWidth * cells.widthPx, snapshot.height * cells.heightPx) : undefined;
-    const mapTop = this.drag?.kind === "map" && mapGeometry ? this.drag.position * mapGeometry.travel : mapGeometry?.top;
+    // The image draws the viewport; a cell highlight underneath can leak out when it moves.
+    const mapPadding = " ".repeat(Math.max(0, width - 3));
     const theme = this.ctx.ui.theme;
     return Array.from({ length: snapshot.height }, (_, row) => {
       const entries = this.tracks[row].end - this.tracks[row].start;
       let mark = "  ";
       if (entries > 1) mark = "≡ ";
       else if (entries) mark = "━ ";
-      const inMapView = mapGeometry && mapTop !== undefined && row + 0.5 >= mapTop && row + 0.5 < mapTop + mapGeometry.size;
-      const mapRow = " ".repeat(miniWidth);
-      return (inMapView ? theme.bg("selectedBg", mapRow) : mapRow) + theme.fg("accent", mark) + " ";
+      return mapPadding + theme.fg("accent", mark) + " ";
     });
   }
 
