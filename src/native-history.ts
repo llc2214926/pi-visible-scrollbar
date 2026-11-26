@@ -20,6 +20,8 @@ interface ChildLines {
 }
 interface NativeFields {
   childLines?: ChildLines;
+  zoneLines?: { lines?: readonly string[] };
+  cache?: { lines?: readonly string[] };
   messageId?: unknown;
   text?: unknown;
   skillBlock?: Partial<host.ParsedSkillBlock>;
@@ -36,7 +38,7 @@ function layout(component: Component): ChildLines | undefined {
   return value && Array.isArray(value.children) && Array.isArray(value.parts) && Array.isArray(value.lines) &&
     value.children.length === value.parts.length ? value : undefined;
 }
-export interface NativeFrame { document: ChildLines; chat: ChildLines; offset: number; lines: readonly string[] }
+export interface NativeFrame { document: ChildLines; chat: ChildLines | Component[]; offset: number; lines: readonly string[] }
 export function transcriptOffset(document: Container, child: Component, width: number, lines: readonly string[]): number | undefined {
   const parent = layout(document);
   return parent?.width === width && parent.lines === lines && parent.children.length === 3 && parent.children[2] === child
@@ -44,16 +46,19 @@ export function transcriptOffset(document: Container, child: Component, width: n
 }
 export function nativeFrame(document: Container, chat: Container, width: number, lines: readonly string[]): NativeFrame | undefined {
   const parent = layout(document), body = layout(chat);
-  if (!parent || !body || parent.width !== width || body.width !== width || parent.lines !== lines ||
-      parent.children.length !== 3 || parent.children[2] !== chat) return undefined;
+  if (!parent || parent.width !== width || parent.lines !== lines || parent.children.length !== 3 || parent.children[2] !== chat) return undefined;
+  const stock = chat.render === Container.prototype.render;
   // Stock Container already proved text equality; identical text can still have new child identities.
-  if (parent.parts[2] !== body.lines && (chat.render !== Container.prototype.render || parent.parts[2].length !== body.lines.length)) return undefined;
-  return { document: parent, chat: body, offset: parent.parts[0].length + parent.parts[1].length, lines };
+  const measured = body?.width === width && (parent.parts[2] === body.lines || (stock && parent.parts[2].length === body.lines.length));
+  if (!measured && stock) return undefined;
+  // A folding renderer may return a different container's rows without populating chat.childLines.
+  return { document: parent, chat: measured ? body : chat.children, offset: parent.parts[0].length + parent.parts[1].length, lines };
 }
 
 type NativeAnchor = Anchor & { rank: number };
 type Candidate = {
   component: Component; source: readonly string[]; row: number; end: number;
+  skillArgument?: boolean;
   input: HistoryRequests["match"]["candidates"][number]; payload?: unknown[]; match?: HistoryMatch | null;
 };
 type Binding = { source: readonly string[]; signature?: string; match: HistoryMatch | null; revision: number; leaf: string | null };
@@ -81,27 +86,111 @@ function candidate(component: Component, source: readonly string[], row: number)
   return { component, source, row, end: row + source.length, input: { id, signature }, payload: id ? undefined : payload };
 }
 
-function* cards(root: ChildLines, offset: number, depth = 0): Generator<Candidate | undefined> {
+function cachedInputRows(component: Component): readonly string[] | undefined {
+  // UserMessageComponent adds OSC zones after Container.render; SkillInvocationMessageComponent is a padded Box.
+  const rows = component instanceof host.UserMessageComponent ? fields(component).zoneLines?.lines
+    : component instanceof host.SkillInvocationMessageComponent ? fields(component).cache?.lines : undefined;
+  return Array.isArray(rows) ? rows : undefined;
+}
+
+function* cards(root: NativeFrame["chat"], offset: number, depth = 0): Generator<Candidate | undefined> {
   if (depth > 64) throw new Error("Native transcript is too deeply nested");
+  const projected = Array.isArray(root), children = projected ? root : root.children;
+  // Without rendered rows there is no stable cache key for a card's signature across frames.
+  const unmeasured: readonly string[] = [];
   let row = offset, skillArguments = false;
-  for (let i = 0; i < root.children.length; i++) {
-    const component = root.children[i], source = root.parts[i], start = row;
+  for (let i = 0; i < children.length; i++) {
+    const component = children[i], source = projected ? cachedInputRows(component) ?? unmeasured : root.parts[i], start = row;
     row += source.length;
     if (skillArguments && component instanceof Spacer) { yield undefined; continue; }
     const skip = skillArguments && component instanceof host.UserMessageComponent;
     skillArguments = false;
-    if (skip) { yield undefined; continue; }
+    if (skip && !projected) { yield undefined; continue; }
     const value = candidate(component, source, start);
     if (value) {
+      if (skip) value.skillArgument = true; // A projection still has to account for these visible rows.
       skillArguments = component instanceof host.SkillInvocationMessageComponent && !!fields(component).skillBlock?.userMessage;
       yield value;
     } else if (component instanceof Container && Object.getPrototypeOf(component) === Container.prototype) {
+      if (projected) { yield* cards(component.children, 0, depth + 1); continue; }
       const child = layout(component);
       if (child?.width === root.width && (child.lines === source ||
           (component.render === Container.prototype.render && child.lines.length === source.length))) yield* cards(child, start, depth + 1);
       else yield undefined;
     } else yield undefined;
   }
+}
+
+// A folded history rail precedes the styled row, but Pi's OSC 133 zones stay at column zero.
+const foldRail = /^((?:\x1b\]133;[ABC](?:\x07|\x1b\\))*)(?:\x1b\[[\d;:]*m)*│(?:\x1b\[[\d;:]*m)* /;
+
+type Span = { count: number; seen: number };
+type RowNode = { next?: Map<string, RowNode>; span?: Span };
+type Hit = { span: Span; row: number; first?: Candidate };
+
+function* displayedSpans(root: RowNode, lines: readonly string[], offset: number): Generator<undefined, Hit[]> {
+  const hits: Hit[] = [];
+  for (let start = 0; start < lines.length; start++) {
+    let node = root;
+    for (let row = start; row < lines.length; row++) {
+      const line = lines[row], next = node.next?.get(line) ?? node.next?.get(line.replace(foldRail, "$1"));
+      if (!next) break;
+      node = next;
+      if (node.span && ++node.span.seen <= node.span.count) hits.push({ span: node.span, row: offset + start });
+      if ((row - start) % 128 === 127) yield undefined;
+    }
+    if (start % 128 === 127) yield undefined;
+  }
+  // A span repeated more often on screen than in the source cannot identify a card.
+  let count = 0;
+  for (const hit of hits) { if (hit.span.seen <= hit.span.count) hits[count++] = hit; yield undefined; }
+  hits.length = count;
+  return hits;
+}
+
+// Index complete cached input spans, not prompt labels or the heights of hidden raw children.
+function* projectedCards(children: Component[], lines: readonly string[], offset: number): Generator<Candidate | undefined> {
+  const root: RowNode = {}, ordered: { card: Candidate; span?: Span }[] = [];
+  for (const card of cards(children, 0)) {
+    if (card) {
+      let node = root;
+      for (let i = 0; i < card.source.length; i++) {
+        const children = node.next ??= new Map<string, RowNode>(), line = card.source[i];
+        let child = children.get(line);
+        if (!child) children.set(line, child = {});
+        node = child;
+        if (i % 128 === 127) yield undefined;
+      }
+      const span = card.source.length ? node.span ??= { count: 0, seen: 0 } : undefined;
+      if (span) span.count++;
+      card.row = card.end = 0;
+      ordered.push({ card, span });
+    }
+    yield undefined;
+  }
+  const hits = yield* displayedSpans(root, lines, offset);
+  // Only publish a visible row if matching from either end identifies the same source card.
+  let pos = 0;
+  for (const { card, span } of ordered) {
+    if (span && hits[pos]?.span === span) hits[pos++].first = card;
+    yield undefined;
+  }
+  if (pos === hits.length) {
+    for (let i = ordered.length - 1; pos && i >= 0; i--) {
+      const { card, span } = ordered[i], hit = hits[pos - 1];
+      if (span === hit.span) {
+        if (card === hit.first) { card.row = hit.row; card.end = hit.row + card.source.length; }
+        pos--;
+      }
+      yield undefined;
+    }
+  }
+  for (const { card } of ordered) yield card.skillArgument ? undefined : card;
+}
+
+function sameChat(a?: NativeFrame, b?: NativeFrame): boolean {
+  return !!a && !!b && a.chat === b.chat && a.offset === b.offset && a.document.width === b.document.width &&
+    a.document.parts[2] === b.document.parts[2];
 }
 
 /** Geometry and identity work is coalesced into short tasks, never part of transcript rendering. */
@@ -121,13 +210,15 @@ export class NativeHistory {
     private changed: (redraw: boolean) => void, private failed: (error: unknown) => void) {}
 
   private current(): Indexed | undefined {
-    return !this.dirty && this.indexed?.frame.chat === this.latest?.chat && this.indexed?.frame.offset === this.latest?.offset ? this.indexed : undefined;
+    return !this.dirty && sameChat(this.indexed?.frame, this.latest) ? this.indexed : undefined;
   }
   get anchors(): NativeAnchor[] {
     const previous = this.indexed, latest = this.latest;
-    // Keep stable visual dots during background work; anchor() still rejects unverified hit positions.
-    return this.current()?.anchors ?? (previous && latest && previous.frame.chat.width === latest.chat.width &&
-      previous.frame.offset === latest.offset ? previous.anchors : EMPTY);
+    if (!previous || !latest) return EMPTY;
+    const frame = previous.frame;
+    // A projection can hide any input. Only the native layout keeps its dots while new rows are measured.
+    if (Array.isArray(frame.chat) || Array.isArray(latest.chat)) return sameChat(frame, latest) ? previous.anchors : EMPTY;
+    return frame.document.width === latest.document.width && frame.offset === latest.offset ? previous.anchors : EMPTY;
   }
   anchor(id: string): NativeAnchor | undefined { return this.current()?.byId.get(id); }
   get isPending(): boolean { return !!this.latest && !this.current(); }
@@ -173,7 +264,8 @@ export class NativeHistory {
     try {
       const summary = await this.ready(); check();
       const candidates: Candidate[] = [];
-      for (const card of cards(frame.chat, frame.offset)) {
+      const visible = Array.isArray(frame.chat) ? projectedCards(frame.chat, frame.document.parts[2], frame.offset) : cards(frame.chat, frame.offset);
+      for (const card of visible) {
         if (card) candidates.push(card);
         if (performance.now() >= deadline) await pause();
       }
@@ -227,7 +319,8 @@ export class NativeHistory {
       }
       same &&= anchors.length === previous?.anchors.length;
       let from = frame.offset, oldEnd = previous?.frame.offset ?? 0, end = frame.offset;
-      if (previous && previous.frame.document.parts[0] === frame.document.parts[0] && previous.frame.document.parts[1] === frame.document.parts[1]) {
+      if (previous && !Array.isArray(previous.frame.chat) && !Array.isArray(frame.chat) &&
+          previous.frame.document.parts[0] === frame.document.parts[0] && previous.frame.document.parts[1] === frame.document.parts[1]) {
         const old = previous.frame.chat;
         let oldRow = previous.frame.offset, row = frame.offset, first = true;
         for (let i = 0; i < Math.max(old.parts.length, frame.chat.parts.length); i++) {
@@ -242,11 +335,12 @@ export class NativeHistory {
       } else { from = 0; oldEnd = previous?.frame.lines.length ?? 0; end = frame.lines.length; }
       check();
       // A newer render may arrive during the scan. Keep the useful bindings, not stale hit targets.
-      if (this.latest?.chat === frame.chat && this.latest.offset === frame.offset) {
+      if (sameChat(this.latest, frame)) {
         this.lineChange = previous ? { previous: new WeakRef(previous.frame.lines), from, oldEnd, end } : undefined;
+        const redraw = !same || this.anchors.length !== anchors.length;
         this.dirty = false;
         this.indexed = { frame, anchors: same ? previous!.anchors : anchors, byId: same ? previous!.byId : byId };
-        this.changed(!same);
+        this.changed(redraw);
       }
     } catch (error) {
       if (!isHistoryCancelled(error) && !this.disposed) { this.latest = undefined; this.indexed = undefined; this.lineChange = undefined; this.failure = true; this.failed(error); }
