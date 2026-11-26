@@ -1,5 +1,16 @@
 import { allocateImageId, deleteKittyImage, encodeKitty, type CellDimensions } from "@earendil-works/pi-tui";
-import type { MinimapLayers } from "./minimap.ts";
+import type { MinimapComposite, MinimapLayers } from "./minimap.ts";
+
+// Pi's encodeKitty encodes PNG. Raw transfers use the same 4096-character limit, with replies suppressed on every chunk.
+function transmitRgba(payload: string, image: MinimapComposite, id: number): string {
+  const header = `a=t,f=32,s=${image.width},v=${image.height},o=z,i=${id},`;
+  let output = "";
+  for (let start = 0; start < payload.length; start += 4096) {
+    const end = start + 4096;
+    output += `\x1b_G${start === 0 ? header : ""}q=2,m=${end < payload.length ? 1 : 0};${payload.slice(start, end)}\x1b\\`;
+  }
+  return output;
+}
 
 /** Two owned images and stable placement IDs. Scroll cached text by cropping its background placement. */
 export class KittyLayers {
@@ -60,20 +71,28 @@ export class KittyLayers {
     return output;
   }
 
-  drawComposite(png: Buffer, box: { x: number; y: number; width: number; height: number }, cells: CellDimensions, preserved: boolean, cleared: boolean): string {
+  drawComposite(image: MinimapComposite, box: { x: number; y: number; width: number; height: number }, cells: CellDimensions, preserved: boolean, cleared: boolean): string {
     if (cleared) this.forget();
     const position = `${box.x}:${box.y}:${box.width}:${box.height}:${cells.widthPx}:${cells.heightPx}`;
-    if (preserved && this.composite === png && this.compositePosition === position) return "";
+    if (preserved && this.composite === image.data && this.compositePosition === position) return "";
     const columns = this.transposeDimensions ? box.height : box.width;
     const rows = this.transposeDimensions ? box.width : box.height;
     const remove = this.uploaded ? deleteKittyImage(this.backgroundId) + deleteKittyImage(this.viewportId) : "";
-    const image = encodeKitty(png.toString("base64"), { imageId: this.backgroundId, columns, rows, moveCursor: false });
+    const payload = image.data.toString("base64"), id = this.backgroundId;
+    let sequence: string;
+    if (image.format === "rgba") {
+      // iTerm 3.6.0–3.6.4 loses PNG scaledSize in its decoder. Send packed pixels and place once after the final chunk.
+      sequence = transmitRgba(payload, image, id);
+      sequence += `\x1b_Ga=p,i=${id},p=${id},C=1,q=0,c=${columns},r=${rows},z=1\x1b\\`;
+    } else {
+      sequence = encodeKitty(payload, { imageId: id, columns, rows, moveCursor: false });
+    }
     this.background = this.viewport = undefined;
     this.backgroundPosition = this.viewportPosition = "";
-    this.composite = png;
+    this.composite = image.data;
     this.compositePosition = position;
     this.uploaded = true;
-    return `${remove}\x1b[${box.y + 1};${box.x + 1}H${image}`;
+    return `${remove}\x1b[${box.y + 1};${box.x + 1}H${sequence}`;
   }
 
   response(data: string): { retry?: boolean; error?: string } | undefined {

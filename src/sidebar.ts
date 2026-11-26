@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getCellDimensions, matchesKey, truncateToWidth, visibleWidth, type Component, type OverlayHandle, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { bucketRanges, type Anchor, type AnchorRange, type Snapshot } from "./model.ts";
 import { Minimap, minimapGeometry } from "./minimap.ts";
-import { GraphicMinimap, minimapProtocol } from "./graphics.ts";
+import { GraphicMinimap, legacyItermKitty, minimapProtocol } from "./graphics.ts";
 import { Viewport } from "./viewport.ts";
 import { requestViewFrame } from "./native-history.ts";
 
@@ -52,10 +52,10 @@ export class Sidebar implements Component {
           const drag = this.drag?.kind === "map" ? this.drag : undefined;
           const position = drag ? { top: drag.position * minimapGeometry(snapshot, width, height).travel / Math.max(1, snapshot.height), preview } : undefined;
           if (protocol === "kitty") {
-            // iTerm2 replaces overlapping Kitty images instead of alpha-compositing them.
+            // Keep the viewport and text in one non-draggable iTerm placement.
             if (process.env.TERM_PROGRAM === "iTerm.app") {
-              const png = this.map.render(snapshot, width, height, dark, !!drag, position);
-              return png ? { protocol, png } : undefined;
+              const composite = this.map.renderComposite(snapshot, width, height, dark, Boolean(drag), position, legacyItermKitty() ? "rgba" : "png");
+              return composite ? { protocol, composite } : undefined;
             }
             const layers = this.map.renderLayers(snapshot, width, height, dark, !!drag, position);
             return layers ? { protocol, layers } : undefined;
@@ -116,9 +116,10 @@ export class Sidebar implements Component {
   get minimapStatus(): string {
     if (!this.experimentalMinimap) return "off";
     if (this.minimapFailure) return `unavailable: ${this.minimapFailure}`;
-    if (!minimapProtocol(this.viewport.tui)) return "unavailable: needs direct iTerm2/Kitty graphics";
+    const protocol = minimapProtocol(this.viewport.tui);
+    if (!protocol) return "unavailable: needs direct iTerm2/Kitty graphics";
     if (this.viewport.tui.terminal.columns < 60) return "paused: terminal narrower than 60 columns";
-    return this.graphics ? `PNG (${minimapProtocol(this.viewport.tui)})` : "not mounted";
+    return this.graphics ? `${protocol === "kitty" && legacyItermKitty() ? "RGBA" : "PNG"} (${protocol})` : "not mounted";
   }
 
   setMinimap(enabled: boolean): void {

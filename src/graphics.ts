@@ -1,8 +1,8 @@
 import { encodeITerm2, getCapabilities, getCellDimensions, sliceByColumn, visibleWidth, type CellDimensions, type Component, type ImageProtocol, type TUI } from "@earendil-works/pi-tui";
 import { KittyLayers } from "./kitty.ts";
-import type { MinimapLayers } from "./minimap.ts";
+import type { MinimapComposite, MinimapLayers } from "./minimap.ts";
 
-type GraphicImage = { protocol: "iterm2"; png: Buffer } | { protocol: "kitty"; layers: MinimapLayers } | { protocol: "kitty"; png: Buffer };
+type GraphicImage = { protocol: "iterm2"; png: Buffer } | { protocol: "kitty"; layers: MinimapLayers } | { protocol: "kitty"; composite: MinimapComposite };
 
 const BEGIN = "\x1b[?2026h", END = "\x1b[?2026l", SAVE = "\x1b7", RESTORE = "\x1b8";
 const isImageLine = (line: string) => line.includes("\x1b_G") || line.includes("\x1b]1337;File=");
@@ -20,7 +20,7 @@ function renderer(tui: TUI): Renderer {
   return tui.valueOf() as Renderer;
 }
 
-function iTermKittyDimensionsReversed(): boolean {
+export function legacyItermKitty(): boolean {
   if (process.env.TERM_PROGRAM !== "iTerm.app") return false;
   const version = /^(\d+)\.(\d+)\.(\d+)(?:\.|$)/.exec(process.env.TERM_PROGRAM_VERSION ?? "");
   return version !== null && Number(version[1]) === 3 && Number(version[2]) === 6 && Number(version[3]) < 5;
@@ -149,10 +149,10 @@ export class GraphicMinimap {
     const { x, y, width, height } = box;
     const position = `${x}:${y}:${width}:${height}`;
     if (image.protocol === "kitty") {
-      this.kitty ??= new KittyLayers(iTermKittyDimensionsReversed());
+      this.kitty ??= new KittyLayers(legacyItermKitty());
       const sequence = "layers" in image
         ? this.kitty.draw(image.layers, box, cells, preserved, cleared)
-        : this.kitty.drawComposite(image.png, box, cells, preserved, cleared);
+        : this.kitty.drawComposite(image.composite, box, cells, preserved, cleared);
       this.painted = true;
       this.lastImage = undefined;
       this.lastBox = position;
