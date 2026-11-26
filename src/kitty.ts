@@ -38,14 +38,15 @@ export class KittyLayers {
     };
     if (backgroundChanged) upload(this.backgroundId, layers.background);
     if (viewportChanged) upload(this.viewportId, layers.viewport);
+    // iTerm2 3.6.4 replaces placements by p alone, so each layer needs its own ID.
     if (backgroundChanged || !preserved || backgroundPosition !== this.backgroundPosition) {
-      output += `\x1b[${box.y + 1};${box.x + 1}H\x1b_Ga=p,i=${this.backgroundId},p=1,C=1,q=0,c=${columns},r=${rows},y=${layers.backgroundTop},h=${layers.backgroundHeight},z=0\x1b\\`;
+      output += `\x1b[${box.y + 1};${box.x + 1}H\x1b_Ga=p,i=${this.backgroundId},p=${this.backgroundId},C=1,q=0,c=${columns},r=${rows},y=${layers.backgroundTop},h=${layers.backgroundHeight},z=0\x1b\\`;
     }
     if (backgroundChanged || viewportChanged || !preserved || viewportPosition !== this.viewportPosition) {
       // iTerm2 3.6.0–3.6.4 swapped Kitty's c/r fields; specify only columns for a fractional-height frame.
       const axis = this.transposeDimensions ? "r" : "c";
       const size = layers.fullHeight ? `,c=${columns},r=${rows}` : `,${axis}=${box.width}`;
-      output += `\x1b[${row + 1};${box.x + 1}H\x1b_Ga=p,i=${this.viewportId},p=1,C=1,q=0${size},Y=${offset},z=1\x1b\\`;
+      output += `\x1b[${row + 1};${box.x + 1}H\x1b_Ga=p,i=${this.viewportId},p=${this.viewportId},C=1,q=0${size},Y=${offset},z=1\x1b\\`;
     }
     this.background = layers.background;
     this.viewport = layers.viewport;
