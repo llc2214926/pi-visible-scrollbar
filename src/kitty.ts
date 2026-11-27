@@ -92,7 +92,8 @@ export class KittyLayers {
     this.composite = image.data;
     this.compositePosition = position;
     this.uploaded = true;
-    return `${remove}\x1b[${box.y + 1};${box.x + 1}H${sequence}`;
+    // C=1 leaves the cursor on our first blank cell. ECH dirties it so an idle iTerm redraws the placement.
+    return `${remove}\x1b[${box.y + 1};${box.x + 1}H${sequence}\x1b[1X`;
   }
 
   response(data: string): { retry?: boolean; error?: string } | undefined {

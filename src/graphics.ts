@@ -11,7 +11,8 @@ interface Renderer {
   doRender(): void;
   resetRenderState(): void;
   getScreenLines(): string[];
-  currentLayout?: { root: Box };
+  currentLayout?: { root: Box; width: number; height: number };
+  stopped?: boolean;
   imageProtocol?: ImageProtocol;
 }
 function renderer(tui: TUI): Renderer {
@@ -47,7 +48,7 @@ export class GraphicMinimap {
   private painted = false;
   private lastImage?: Buffer;
   private lastBox = "";
-  private shown?: { root: Box; rect: { x: number; y: number; width: number; height: number }; cells: CellDimensions };
+  private target?: { root: Box; rect: Box["rect"]; cells: CellDimensions };
   private queriedSize = "";
   private disposed = false;
 
@@ -69,14 +70,14 @@ export class GraphicMinimap {
       // Remove the image before modal UI paints; a forced frame also restores unchanged overlay rows.
       const overlays = this.tui.hasOverlay();
       if (overlays && this.painted) host.resetRenderState();
-      const before = host.getScreenLines();
+      const before = host.getScreenLines(), previousLayout = host.currentLayout;
       const terminal = this.tui.terminal, write = terminal.write, packets: string[] = [];
       const collect = (data: string) => { packets.push(data); };
       terminal.write = collect;
       try { this.original.call(host); }
       catch (error) { write.call(terminal, packets.join("")); throw error; }
       finally { if (terminal.write === collect) terminal.write = write; }
-      if (!packets.length) return;
+      if (!packets.length && host.currentLayout === previousLayout) return;
       const frame = { output: packets.join("") };
       let sequence = "";
       try {
@@ -89,8 +90,9 @@ export class GraphicMinimap {
         this.failed(error);
       }
       const end = frame.output.lastIndexOf(END);
-      if (sequence && end >= 0) frame.output = frame.output.slice(0, end) + sequence + frame.output.slice(end);
-      write.call(terminal, frame.output);
+      if (sequence) frame.output = end < 0 ? frame.output + BEGIN + sequence + END
+        : frame.output.slice(0, end) + sequence + frame.output.slice(end);
+      if (frame.output) write.call(terminal, frame.output);
     };
     host.doRender = this.wrapped;
   }
@@ -99,50 +101,51 @@ export class GraphicMinimap {
 
   /** Paint only our image cells; pointer previews use the cached raster without reading history. */
   redraw(preview = true): boolean {
-    const shown = this.shown, cells = getCellDimensions(), protocol = minimapProtocol(this.tui);
-    if (this.disposed || !this.painted || !shown || !protocol || this.tui.hasOverlay() ||
-        renderer(this.tui).currentLayout?.root !== shown.root || cells.widthPx !== shown.cells.widthPx || cells.heightPx !== shown.cells.heightPx) return false;
+    const target = this.target, cells = getCellDimensions(), protocol = minimapProtocol(this.tui);
+    const host = renderer(this.tui), layout = host.currentLayout;
+    if (this.disposed || host.stopped || !target || (preview && !this.painted) || !protocol || this.tui.hasOverlay() ||
+        layout?.root !== target.root || layout.width !== this.tui.terminal.columns || layout.height !== this.tui.terminal.rows ||
+        cells.widthPx !== target.cells.widthPx || cells.heightPx !== target.cells.heightPx) return false;
     try {
-      const image = this.png(shown.rect.width * cells.widthPx, shown.rect.height * cells.heightPx, protocol, preview);
+      const image = this.png(target.rect.width * cells.widthPx, target.rect.height * cells.heightPx, protocol, preview);
       if (!image) return false;
-      const sequence = this.paint(image, shown.rect, cells, true, false);
+      const sequence = this.paint(image, target.rect, cells, this.painted, false);
       if (sequence) this.tui.terminal.write(`${BEGIN}${sequence}${END}`);
       return true;
     } catch (error) { this.failed(error); return false; }
   }
 
   private draw(before: string[], frame: { output: string }): string {
-    const cleared = frame.output.includes("\x1b[2J") || /\x1b_Ga=d,d=[aA],/.test(frame.output);
+    const cleared = frame.output.includes("\x1b[2J") || frame.output.includes("\x1b_Ga=d,d=a,") || frame.output.includes("\x1b_Ga=d,d=A,");
     const protocol = minimapProtocol(this.tui);
     const root = renderer(this.tui).currentLayout?.root;
     const visit = (box: Box): Box | undefined => box.component === this.component ? box : box.children.map(visit).find(Boolean);
     const box = root && visit(root);
     if (!protocol || !root || !box || box.rect.width <= 3 || box.rect.height < 1) {
-      if (this.painted) {
-        this.tui.requestRender(true);
-        return this.clearImage();
-      }
-      return "";
+      if (this.painted) this.tui.requestRender(true);
+      return this.clearImage();
     }
     const { x, y, height } = box.rect, width = box.rect.width - 3;
     const terminalSize = `${this.tui.terminal.columns}:${this.tui.terminal.rows}`;
-    const query = terminalSize !== this.queriedSize ? "\x1b[16t" : "";
+    const query = terminalSize === this.queriedSize ? "" : "\x1b[16t";
     this.queriedSize = terminalSize;
     // Fullscreen Pi skips this query for iTerm2 after disabling generic images. Its normal input
     // handler still consumes the reply and updates cell dimensions; do not change capabilities.
     const cells = getCellDimensions();
     const image = this.png(width * cells.widthPx, height * cells.heightPx, protocol, false);
-    if (!image) {
-      if (!this.painted) return query;
+    const rect = { x, y, width, height };
+    let sequence = "";
+    if (image) {
+      const preserved = this.painted && !cleared && this.lastBox === `${x}:${y}:${width}:${height}` &&
+        this.preserveImage(frame, before, renderer(this.tui).getScreenLines(), x, y, width, height);
+      sequence = this.paint(image, rect, cells, preserved, cleared);
+    } else if (this.painted) {
       if (!cleared) this.tui.requestRender(true);
-      return query + this.clearImage();
+      sequence = this.clearImage();
     }
-    const after = renderer(this.tui).getScreenLines();
-    const position = `${x}:${y}:${width}:${height}`;
-    const preserved = this.painted && !cleared && this.lastBox === position &&
-      this.preserveImage(frame, before, after, x, y, width, height);
-    this.shown = { root, rect: { x, y, width, height }, cells: { ...cells } };
-    return query + this.paint(image, this.shown.rect, cells, preserved, cleared);
+    // Keep the destination even on a cold miss: the worker can finish after the last text frame.
+    this.target = { root, rect, cells: { ...cells } };
+    return query + sequence;
   }
 
   private paint(image: GraphicImage, box: { x: number; y: number; width: number; height: number }, cells: CellDimensions, preserved: boolean, cleared: boolean): string {
@@ -191,7 +194,7 @@ export class GraphicMinimap {
   private clearImage(): string {
     this.painted = false;
     this.lastImage = undefined;
-    this.shown = undefined;
+    this.target = undefined;
     return this.kitty?.clear() ?? "";
   }
 

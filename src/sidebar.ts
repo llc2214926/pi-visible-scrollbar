@@ -71,7 +71,9 @@ export class Sidebar implements Component {
       this.suppressClick = false;
       this.minimapLayout = proportional;
       this.closePopup();
-      this.viewport.setGutter(this, 3, proportional);
+      // iTerm's direct Kitty image starts left of the text grid by the terminal side margin.
+      const gap = proportional && protocol === "kitty" && process.env.TERM_PROGRAM === "iTerm.app" ? 1 : 0;
+      this.viewport.setGutter(this, 3, proportional, gap);
     }
   }
 

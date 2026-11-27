@@ -58,7 +58,7 @@ export class Viewport {
   readonly history: History;
   failure = "";
   private mount: Mount;
-  private gutter?: { component: Component; width: number; proportional: boolean };
+  private gutter?: { component: Component; width: number; proportional: boolean; gap: number };
   private restoreHost: (() => void)[] = [];
   private scrollbar: ScrollViewScrollbar;
   private originalUpdate: ScrollView["updateLayout"];
@@ -146,7 +146,7 @@ export class Viewport {
     const ownWidth = Object.getOwnPropertyDescriptor(scroll, "getContentWidth");
     const contentWidth = (available: number) => {
       if (this.disposed || !this.gutter) return originalWidth.call(scroll, available);
-      const width = this.gutter.width;
+      const width = this.gutter.width + this.gutter.gap;
       const reserve = width + (this.gutter.proportional ? Math.round(Math.max(0, available - width) * MINIMAP_RATIO / (1 + MINIMAP_RATIO)) : 0);
       return Math.max(1, available - reserve);
     };
@@ -216,9 +216,9 @@ export class Viewport {
     this.dispose();
   }
 
-  setGutter(component: Component, width: number, proportional = false): void {
+  setGutter(component: Component, width: number, proportional = false, gap = 0): void {
     if (this.mount.entry.component !== this.mount.scroll) throw new Error("Another extension replaced the transcript slot.");
-    this.gutter = { component, width, proportional };
+    this.gutter = { component, width, proportional, gap };
     this.tui.requestRender();
   }
 
@@ -228,8 +228,8 @@ export class Viewport {
     const find = (box: LayoutBox): LayoutBox | undefined => box.scrollView === this.mount.scroll ? box : box.children.map(find).find(Boolean);
     const scroll = find(root);
     if (!scroll || !scroll.children.length) return;
-    const body = scroll.children[0].rect.width;
-    const rect = { x: scroll.rect.x + body, y: scroll.rect.y, width: Math.max(0, scroll.rect.width - body), height: scroll.rect.height };
+    const start = scroll.children[0].rect.width + gutter.gap;
+    const rect = { x: scroll.rect.x + start, y: scroll.rect.y, width: Math.max(0, scroll.rect.width - start), height: scroll.rect.height };
     if (rect.width < 2 || rect.height < 1) return;
     const clip = {
       x: Math.max(rect.x, scroll.clip.x), y: Math.max(rect.y, scroll.clip.y),
