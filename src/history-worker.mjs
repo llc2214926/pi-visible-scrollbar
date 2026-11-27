@@ -22,7 +22,8 @@ let active, sourceSerial = 0, draining = false;
 const abort = () => new DOMException("History request cancelled", "AbortError");
 const check = job => { if (job.cancelled) throw abort(); };
 const send = message => parentPort.postMessage(message);
-const safeError = error => tui.stripTerminalSequences(error instanceof Error ? error.message : String(error)).replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 240);
+const CONTROL_CHARS = /\p{Cc}/gu;
+const safeError = error => tui.stripTerminalSequences(error instanceof Error ? error.message : String(error)).replace(CONTROL_CHARS, " ").slice(0, 240);
 function textContent(content, separator = "") {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -30,7 +31,7 @@ function textContent(content, separator = "") {
 }
 function digest(value) { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
 function summaryLabel(text) {
-  const clean = tui.stripTerminalSequences(text).replace(/[\x00-\x1f\x7f-\x9f]/g, " ").trim().replace(/\s+/g, " ");
+  const clean = tui.stripTerminalSequences(text).replace(CONTROL_CHARS, " ").trim().replace(/\s+/g, " ");
   let preview = "", count = 0;
   for (const character of clean) { if (count++ === 160) break; preview += character; }
   return preview || "[Empty input]";
@@ -241,6 +242,7 @@ class Branch {
   }
 
   resetIndexes() {
+    searchKeys = []; searchKeyUnits = 0;
     this.prompts = []; this.promptById = new Map(); this.signatures = new Map();
     this.calls = new Map(); this.results = new Map(); this.paired = new Set(); this.units = []; this.unitById = new Map();
   }
@@ -252,7 +254,10 @@ class Branch {
     }
     if (meta.signature) {
       let list = this.signatures.get(meta.signature);
-      if (!list) this.signatures.set(meta.signature, list = []);
+      if (!list) {
+        list = [];
+        this.signatures.set(meta.signature, list);
+      }
       list.push(entryIndex);
     }
     for (let i = 0; i < (meta.calls?.length ?? 0); i++) this.calls.set(meta.calls[i], { owner: meta.id, slot: i });
@@ -261,7 +266,8 @@ class Branch {
     if (meta.display && !this.paired.has(meta.id)) { this.unitById.set(meta.id, this.units.length); this.units.push(meta); }
   }
 
-  match(candidates, cursor = this.entries.length - 1) {
+  match(candidates, startCursor = this.entries.length - 1) {
+    let cursor = startCursor;
     const matches = [];
     for (const candidate of candidates) {
       let index = candidate.id ? this.positions.get(candidate.id) : undefined;
@@ -341,7 +347,7 @@ async function unit(meta, layout, job) {
       } else if (message.role === "bashExecution") {
         group.addChild(new tui.Text(tui.stripTerminalSequences(`$ ${message.command}\n${message.output}`), 1, 1));
         if (typeof message.fullOutputError === "string" && message.fullOutputError.trim()) {
-          const warning = tui.stripTerminalSequences(`Could not save the full output: ${message.fullOutputError}`).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+          const warning = tui.stripTerminalSequences(`Could not save the full output: ${message.fullOutputError}`).replace(CONTROL_CHARS, " ");
           group.addChild(new tui.Text(themes.theme.fg("warning", warning), 1, 0));
         }
       } else if (message.role === "compactionSummary" || message.role === "branchSummary") {
@@ -436,13 +442,19 @@ async function page(input, job) {
   return result;
 }
 
+let searchKeys = [], searchKeyUnits = 0;
 async function query(input, job) {
   const text = input.text.trim().toLocaleLowerCase(), items = [];
   if (!text) return { items: branch.prompts.slice(input.offset, input.offset + input.limit), total: branch.prompts.length, offset: input.offset };
   let total = 0;
   for (let i = 0; i < branch.prompts.length; i++) {
     const prompt = branch.prompts[i];
-    if (!text || `${prompt.rank + 1} ${prompt.label}`.toLocaleLowerCase().includes(text)) {
+    let key = searchKeys[i];
+    if (key === undefined) {
+      key = `${prompt.rank + 1} ${prompt.label}`.toLocaleLowerCase();
+      if (i === searchKeys.length && i < 65536 && searchKeyUnits + key.length <= 4 * 1024 * 1024) { searchKeys.push(key); searchKeyUnits += key.length; }
+    }
+    if (key.includes(text)) {
       if (total >= input.offset && items.length < input.limit) items.push(prompt);
       total++;
     }

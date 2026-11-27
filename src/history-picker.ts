@@ -3,6 +3,7 @@ import { Input, SelectList, truncateToWidth, type TuiMouseEvent } from "@earendi
 import { isHistoryCancelled } from "./history-client.ts";
 import type { HistoryQuery } from "./history-protocol.ts";
 import { label } from "./model.ts";
+import { requestViewFrame } from "./native-history.ts";
 
 /** Only one small result page lives in the modal; filtering never walks the session on the UI thread. */
 export async function pickHistory(ctx: ExtensionContext, query: (text: string, offset: number, limit: number) => Promise<HistoryQuery>,
@@ -24,7 +25,7 @@ export async function pickHistory(ctx: ExtensionContext, query: (text: string, o
         page = result; loading = false;
         list = new SelectList(result.items.map(item => ({ value: item.id, label: `${item.rank + 1}. ${item.label}` })), limit, getSelectListTheme());
         list.onSelect = item => close(item.value); list.onCancel = abort;
-        tui.requestRender();
+        requestViewFrame(tui);
       }).catch(reason => {
         if (closed || version !== serial || isHistoryCancelled(reason)) return;
         loading = false; error = label((reason instanceof Error ? reason.message : String(reason)).slice(0, 1024)); tui.requestRender();
